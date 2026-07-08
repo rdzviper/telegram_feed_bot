@@ -219,6 +219,13 @@ async def get_total_likes() -> int:
             return row[0] or 0
 
 
+async def get_user_choice(msg_id: int) -> str | None:
+    async with aiosqlite.connect(config.DB_PATH) as db:
+        async with db.execute("SELECT user_choice FROM messages WHERE id = ?", (msg_id,)) as cur:
+            row = await cur.fetchone()
+            return row[0] if row else None
+
+
 async def set_user_choice(msg_id: int, choice: str):
     async with aiosqlite.connect(config.DB_PATH) as db:
         await db.execute(

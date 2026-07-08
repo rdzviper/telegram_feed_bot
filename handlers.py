@@ -56,6 +56,17 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith(("like:", "dislike:")):
         choice, msg_id_str = data.split(":", 1)
         msg_id = int(msg_id_str)
+
+        # защита от повторного голосования
+        prev = await db.get_user_choice(msg_id)
+        if prev:
+            await query.answer("Уже оценено")
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+            return
+
         await db.set_user_choice(msg_id, choice)
         await db.increment_channel_vote(msg_id, choice)
         concepts = await db.get_message_concepts(msg_id)
@@ -65,13 +76,23 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.info("%s concepts=%s delta=%s", choice, concepts, delta)
         label = "✅ Интересно" if choice == "like" else "❌ Не интересно"
         await query.answer(label)
+
+        # медиа-пост несёт caption, текстовый — text; убираем кнопки после голоса
         try:
-            await query.edit_message_text(
-                text=f"{query.message.text}\n{label}",
-                parse_mode="HTML",
-            )
-        except Exception:
-            pass
+            if query.message.caption is not None:
+                await query.edit_message_caption(
+                    caption=f"{query.message.caption_html}\n{label}",
+                    parse_mode="HTML",
+                    reply_markup=None,
+                )
+            else:
+                await query.edit_message_text(
+                    text=f"{query.message.text_html}\n{label}",
+                    parse_mode="HTML",
+                    reply_markup=None,
+                )
+        except Exception as e:
+            logger.error("edit after vote failed: %s", e)
 
     elif data.startswith("toggle:"):
         channel_id = int(data.split(":", 1)[1])
