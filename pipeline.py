@@ -1,12 +1,9 @@
 import html
-import io
 import logging
-import os
 from collections import deque
 from datetime import datetime, timezone
 
 from telethon import TelegramClient
-from telethon.extensions import html as tl_html
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 
 import config
@@ -18,15 +15,6 @@ logger = logging.getLogger(__name__)
 _forwarded_times: deque = deque()
 _drift_counter = 0
 
-
-def _message_html(message, limit: int) -> str:
-    """Конвертирует форматирование поста (bold, ссылки и т.д.) в HTML для Bot API."""
-    raw = message.raw_text or ""
-    entities = message.entities or []
-    if len(raw) > limit:
-        raw = raw[:limit]
-        entities = [e for e in entities if e.offset + e.length <= limit]
-    return tl_html.unparse(raw, entities)
 
 
 def _rate_limit_ok() -> bool:
@@ -138,53 +126,28 @@ async def process_message(event, tg_client: TelegramClient, bot: Bot):
         ]
     ])
 
-    body_short = _message_html(event.message, 900)
-    body_full = _message_html(event.message, 3500)
-    media_caption = f"{header}\n\n{body_short}" if body_short else header
-
-    # файлы крупнее лимита отправляем как текст со ссылкой
-    _MAX_MEDIA_BYTES = int(os.getenv("MAX_MEDIA_MB", "10")) * 1024 * 1024
-    file_size = getattr(getattr(event.message, "file", None), "size", 0) or 0
-    send_as_text = not event.message.media or file_size > _MAX_MEDIA_BYTES
-    if file_size > _MAX_MEDIA_BYTES:
-        logger.info("Media too large (%d MB), sending text only", file_size // 1024 // 1024)
-
     bot_message_id = None
-    if send_as_text:
-        try:
-            sent = await bot.send_message(
-                chat_id=config.NOTIFY_CHAT_ID,
-                text=f"{header}\n\n{body_full}",
-                parse_mode="HTML",
-                reply_markup=keyboard,
-                disable_web_page_preview=True,
-            )
-            bot_message_id = sent.message_id
-        except Exception as e:
-            logger.error("Send message failed: %s", e)
-    else:
-        try:
-            buf = io.BytesIO(await tg_client.download_media(event.message, bytes))
-        except Exception as e:
-            logger.error("Download failed: %s", e)
-            buf = None
-        if buf is not None:
-            try:
-                if event.message.photo:
-                    buf.name = "photo.jpg"
-                    sent = await bot.send_photo(config.NOTIFY_CHAT_ID, photo=buf, caption=media_caption, parse_mode="HTML", reply_markup=keyboard)
-                elif event.message.video:
-                    buf.name = "video.mp4"
-                    sent = await bot.send_video(config.NOTIFY_CHAT_ID, video=buf, caption=media_caption, parse_mode="HTML", reply_markup=keyboard)
-                elif event.message.gif:
-                    buf.name = "animation.mp4"
-                    sent = await bot.send_animation(config.NOTIFY_CHAT_ID, animation=buf, caption=media_caption, parse_mode="HTML", reply_markup=keyboard)
-                else:
-                    buf.name = "file"
-                    sent = await bot.send_document(config.NOTIFY_CHAT_ID, document=buf, caption=media_caption, parse_mode="HTML", reply_markup=keyboard)
-                bot_message_id = sent.message_id
-            except Exception as e:
-                logger.error("Upload failed: %s", e)
+    try:
+        await tg_client.forward_messages(
+            config.NOTIFY_CHAT_ID,
+            event.message.id,
+            event.chat_id,
+        )
+        logger.info("Forwarded OK: channel=%s", channel_name)
+    except Exception as e:
+        logger.error("Forward failed: %s", e)
+        return
+
+    try:
+        sent = await bot.send_message(
+            chat_id=config.NOTIFY_CHAT_ID,
+            text="​",
+            reply_markup=keyboard,
+        )
+        bot_message_id = sent.message_id
+        logger.info("Голосовалка sent: msg_id=%s", bot_message_id)
+    except Exception as e:
+        logger.error("Send keyboard failed: %s", e)
 
     _forwarded_times.append(datetime.now(timezone.utc).timestamp())
     await db.mark_forwarded(msg_id, bot_message_id, is_drift)
