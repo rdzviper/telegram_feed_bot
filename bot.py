@@ -5,6 +5,7 @@ import os
 from telethon import TelegramClient, events
 from telegram import Bot
 from telegram.ext import Application
+from telegram.request import HTTPXRequest
 
 import config
 import database as db
@@ -24,7 +25,15 @@ async def main():
     logger.info("DB ready")
 
     tg_client = TelegramClient(config.SESSION_PATH, config.TG_API_ID, config.TG_API_HASH)
-    bot = Bot(token=config.BOT_TOKEN)
+
+    _request = HTTPXRequest(
+        connection_pool_size=8,
+        read_timeout=60,
+        write_timeout=60,   # загрузка медиа может быть долгой
+        connect_timeout=15,
+        pool_timeout=30,
+    )
+    bot = Bot(token=config.BOT_TOKEN, request=_request)
 
     @tg_client.on(events.NewMessage())
     async def on_new_message(event):
