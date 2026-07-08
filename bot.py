@@ -1,0 +1,75 @@
+import asyncio
+import logging
+import os
+
+from telethon import TelegramClient, events
+from telegram import Bot
+from telegram.ext import Application
+
+import config
+import database as db
+from pipeline import process_message
+from handlers import register_handlers
+
+logging.basicConfig(
+    format="%(asctime)s %(name)-20s %(levelname)s %(message)s",
+    level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
+)
+logger = logging.getLogger(__name__)
+
+
+async def main():
+    os.makedirs(config.DATA_DIR, exist_ok=True)
+    await db.init_db()
+    logger.info("DB ready")
+
+    tg_client = TelegramClient(config.SESSION_PATH, config.TG_API_ID, config.TG_API_HASH)
+    bot = Bot(token=config.BOT_TOKEN)
+
+    @tg_client.on(events.NewMessage())
+    async def on_new_message(event):
+        if config.DEBUG_ALL_MESSAGES:
+            logger.info(
+                "[DEBUG] chat_id=%s post=%s is_channel=%s megagroup=%s text=%.60r",
+                event.chat_id,
+                event.message.post,
+                event.is_channel,
+                getattr(event.chat, "megagroup", None),
+                event.message.text or "",
+            )
+        if not event.message.post:
+            return
+        if event.chat_id == config.NOTIFY_CHAT_ID:
+            return
+        try:
+            await process_message(event, tg_client, bot)
+        except Exception as e:
+            logger.error("Pipeline error: %s", e, exc_info=True)
+
+    application = Application.builder().token(config.BOT_TOKEN).build()
+    register_handlers(application)
+
+    await application.initialize()
+    await application.start()
+    await application.updater.start_polling()
+    logger.info("Bot polling started")
+
+    await tg_client.start()
+    logger.info("Userbot connected")
+
+    logger.info("Syncing dialogs...")
+    await tg_client.get_dialogs()
+    logger.info("Dialogs synced")
+
+    await bot.send_message(config.NOTIFY_CHAT_ID, "✅ Бот запущен")
+
+    try:
+        await tg_client.run_until_disconnected()
+    finally:
+        await application.updater.stop()
+        await application.stop()
+        await application.shutdown()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

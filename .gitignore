@@ -1,0 +1,18 @@
+# Секреты
+.env
+
+# Данные (БД, сессия Telethon)
+data/
+*.session
+*.session-journal
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/

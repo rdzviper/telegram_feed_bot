@@ -1,0 +1,5 @@
+telethon==1.36.0
+python-telegram-bot==21.6
+aiosqlite==0.20.0
+openai>=1.57.0
+python-dotenv==1.0.1
