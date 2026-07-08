@@ -131,6 +131,14 @@ async def process_message(event, tg_client: TelegramClient, bot: Bot):
 
     prefix = "🔍 " if is_drift else ""
     header = f'{prefix}<a href="{post_link}">{html.escape(channel_name)}</a>'
+
+    concept_parts = []
+    for c in concepts:
+        w = weights.get(c, 0.15)
+        concept_parts.append(f"{html.escape(c)} {w:+.2f}")
+    score_line = "  ·  ".join(concept_parts)
+    vote_text = f"{score_line}Σ<b>{local_score:.2f}</b>/{threshold:.2f}"
+
     keyboard = InlineKeyboardMarkup([
         [
             InlineKeyboardButton("👍", callback_data=f"like:{msg_id}"),
@@ -153,7 +161,8 @@ async def process_message(event, tg_client: TelegramClient, bot: Bot):
     try:
         sent = await bot.send_message(
             chat_id=config.NOTIFY_CHAT_ID,
-            text="・・・・・・・・・・",
+            text=vote_text,
+            parse_mode="HTML",
             reply_markup=keyboard,
         )
         bot_message_id = sent.message_id

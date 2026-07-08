@@ -81,7 +81,7 @@ async def main():
     await tg_client.get_dialogs()
     logger.info("Dialogs synced")
 
-    await bot.send_message(config.NOTIFY_CHAT_ID, "✅ Бот запущен")
+    await bot.send_message(config.NOTIFY_CHAT_ID, "✅ Бот запущен, лайк +1, дизлайк -0.3")
 
     try:
         await tg_client.run_until_disconnected()
