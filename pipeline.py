@@ -46,18 +46,30 @@ async def process_message(event, tg_client: TelegramClient, bot: Bot):
         logger.debug("channel=%s is disabled, skipping", channel_name)
         return
 
-    recent = await db.get_recent_headlines(hours=24, limit=30)
-
-    logger.debug("Sending to DeepSeek: channel=%s recent=%d", channel_name, len(recent))
-    result = await analyzer.analyze(text, recent)
+    logger.debug("Sending to DeepSeek: channel=%s", channel_name)
+    result = await analyzer.analyze(text)
     concepts = result["concepts"]
     is_ad = result["is_ad"]
-    same_story = result["same_story"]
 
     # локальный scoring по матрице весов
     weights = await db.get_concept_weights(concepts)
     local_score = sum(weights.get(c, 0.15) for c in concepts)
     threshold = await db.get_adaptive_threshold()
+
+    # дедупликация по Jaccard
+    recent_concepts = await db.get_recent_forwarded_concepts(hours=config.DUPLICATE_HOURS)
+    current_set = set(concepts)
+    same_story = False
+    if current_set:
+        for prev in recent_concepts:
+            prev_set = set(prev)
+            if not prev_set:
+                continue
+            jaccard = len(current_set & prev_set) / len(current_set | prev_set)
+            if jaccard >= config.DUPLICATE_JACCARD_THRESHOLD:
+                same_story = True
+                logger.info("Duplicate detected: jaccard=%.2f concepts=%s", jaccard, concepts)
+                break
 
     logger.info(
         "Analyzed: channel=%s concepts=%s local_score=%.1f threshold=%.1f is_ad=%s same_story=%s",
@@ -141,7 +153,7 @@ async def process_message(event, tg_client: TelegramClient, bot: Bot):
     try:
         sent = await bot.send_message(
             chat_id=config.NOTIFY_CHAT_ID,
-            text="​",
+            text="・・・・・・・・・・",
             reply_markup=keyboard,
         )
         bot_message_id = sent.message_id

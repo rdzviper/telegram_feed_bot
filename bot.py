@@ -35,6 +35,20 @@ async def main():
     )
     bot = Bot(token=config.BOT_TOKEN, request=_request)
 
+    queue: asyncio.Queue = asyncio.Queue()
+
+    async def pipeline_worker():
+        while True:
+            event = await queue.get()
+            try:
+                await process_message(event, tg_client, bot)
+            except Exception as e:
+                logger.error("Pipeline error: %s", e, exc_info=True)
+            finally:
+                queue.task_done()
+
+    asyncio.ensure_future(pipeline_worker())
+
     @tg_client.on(events.NewMessage())
     async def on_new_message(event):
         if config.DEBUG_ALL_MESSAGES:
@@ -50,10 +64,7 @@ async def main():
             return
         if event.chat_id == config.NOTIFY_CHAT_ID:
             return
-        try:
-            await process_message(event, tg_client, bot)
-        except Exception as e:
-            logger.error("Pipeline error: %s", e, exc_info=True)
+        await queue.put(event)
 
     application = Application.builder().token(config.BOT_TOKEN).build()
     register_handlers(application)

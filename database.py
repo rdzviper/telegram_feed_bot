@@ -156,6 +156,19 @@ async def mark_forwarded(msg_id: int, bot_message_id: int | None, is_drift: bool
         await db.commit()
 
 
+async def get_recent_forwarded_concepts(hours: int = 24) -> list[list[str]]:
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    async with aiosqlite.connect(config.DB_PATH) as db:
+        async with db.execute(
+            """SELECT concepts FROM messages
+               WHERE forwarded = 1 AND concepts IS NOT NULL AND created_at > ?
+               ORDER BY created_at DESC""",
+            (cutoff,),
+        ) as cur:
+            rows = await cur.fetchall()
+            return [json.loads(r[0]) for r in rows if r[0]]
+
+
 async def get_recent_headlines(hours: int = 24, limit: int = 30) -> list[str]:
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
     async with aiosqlite.connect(config.DB_PATH) as db:
