@@ -67,7 +67,7 @@ async def process_message(event, tg_client: TelegramClient, bot: Bot):
 
     # локальный scoring по матрице весов
     weights = await db.get_concept_weights(concepts)
-    local_score = sum(weights.get(c, 0.0) for c in concepts)
+    local_score = sum(weights.get(c, 0.15) for c in concepts)
     threshold = await db.get_adaptive_threshold()
 
     logger.info(
@@ -75,23 +75,27 @@ async def process_message(event, tg_client: TelegramClient, bot: Bot):
         channel_name, concepts, local_score, threshold, is_ad, same_story,
     )
 
-    msg_id = await db.save_message(
-        channel_id=channel_id,
-        channel_name=channel_name,
-        orig_message_id=event.message.id,
-        text=text,
-        date=event.message.date.isoformat(),
-        score=round(local_score),
-        is_ad=is_ad,
-        same_story=same_story,
-    )
-    await db.save_message_concepts(msg_id, concepts, local_score)
+    try:
+        msg_id = await db.save_message(
+            channel_id=channel_id,
+            channel_name=channel_name,
+            orig_message_id=event.message.id,
+            text=text,
+            date=event.message.date.isoformat(),
+            score=round(local_score),
+            is_ad=is_ad,
+            same_story=same_story,
+        )
+        await db.save_message_concepts(msg_id, concepts, local_score)
+    except Exception as e:
+        logger.error("DB save failed: %s", e, exc_info=True)
+        return
 
     if is_ad:
-        logger.debug("channel=%s filtered: ad", channel_name)
+        logger.info("channel=%s filtered: ad", channel_name)
         return
     if same_story:
-        logger.debug("channel=%s filtered: duplicate story", channel_name)
+        logger.info("channel=%s filtered: duplicate story", channel_name)
         return
 
     should_forward = local_score >= threshold
@@ -103,11 +107,11 @@ async def process_message(event, tg_client: TelegramClient, bot: Bot):
             _drift_counter = 0
             should_forward = True
             is_drift = True
-            logger.debug("Drift forward triggered (every %d)", config.DRIFT_EVERY_N)
+            logger.info("Drift forward triggered (every %d)", config.DRIFT_EVERY_N)
 
     if not should_forward:
-        logger.debug("channel=%s local_score=%.1f < threshold=%.1f, skipping",
-                     channel_name, local_score, threshold)
+        logger.info("channel=%s local_score=%.1f < threshold=%.1f, skip",
+                    channel_name, local_score, threshold)
         return
 
     if not _rate_limit_ok():

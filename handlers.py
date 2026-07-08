@@ -130,6 +130,17 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer()
 
 
+async def error_handler(update, context):
+    err = context.error
+    # таймауты и сетевые ошибки — обычное дело, не нужен трейсбэк
+    from telegram.error import TimedOut, NetworkError
+    if isinstance(err, (TimedOut, NetworkError)):
+        logger.warning("Telegram network error: %s", err)
+    else:
+        logger.error("Unhandled telegram error", exc_info=err)
+
+
 def register_handlers(application):
     application.add_handler(CommandHandler("stats", stats_command))
     application.add_handler(CallbackQueryHandler(button_callback))
+    application.add_error_handler(error_handler)
