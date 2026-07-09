@@ -4,6 +4,8 @@ from collections import deque
 from datetime import datetime, timezone
 
 from telethon import TelegramClient
+from telethon.tl.functions.messages import MarkDialogUnreadRequest
+from telethon.tl.types import InputDialogPeer
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 
 import config
@@ -53,8 +55,16 @@ async def process_message(event, tg_client: TelegramClient, bot: Bot):
 
     # локальный scoring по матрице весов
     weights = await db.get_concept_weights(concepts)
-    local_score = sum(weights.get(c, 0.15) for c in concepts)
     threshold = await db.get_adaptive_threshold()
+    # известные концепты берут свой вес; неизвестные делят порог между собой
+    # (+эпсилон), чтобы пост целиком из новых тем всегда чуть перебивал порог
+    # и не тонул со временем
+    unknown_count = sum(1 for c in concepts if c not in weights)
+    default_w = (
+        round(threshold / unknown_count, 2) + config.UNKNOWN_CONCEPT_EPS
+        if unknown_count else 0.0
+    )
+    local_score = sum(weights.get(c, default_w) for c in concepts)
 
     # дедупликация по Jaccard
     recent_concepts = await db.get_recent_forwarded_concepts(hours=config.DUPLICATE_HOURS)
@@ -134,10 +144,10 @@ async def process_message(event, tg_client: TelegramClient, bot: Bot):
 
     concept_parts = []
     for c in concepts:
-        w = weights.get(c, 0.15)
+        w = weights.get(c, default_w)
         concept_parts.append(f"{html.escape(c)} {w:+.2f}")
     score_line = "  ·  ".join(concept_parts)
-    vote_text = f"{score_line}Σ<b>{local_score:.2f}</b>/{threshold:.2f}"
+    vote_text = f"{score_line} Σ <b>{local_score:.2f}</b>/{threshold:.2f}"
 
     keyboard = InlineKeyboardMarkup([
         [
@@ -169,6 +179,14 @@ async def process_message(event, tg_client: TelegramClient, bot: Bot):
         logger.info("Голосовалка sent: msg_id=%s", bot_message_id)
     except Exception as e:
         logger.error("Send keyboard failed: %s", e)
+
+    # держим notify-чат непрочитанным (свой форвард гасит бейдж) —
+    # флаг серверный, синхронизируется на все клиенты
+    try:
+        peer = await tg_client.get_input_entity(config.NOTIFY_CHAT_ID)
+        await tg_client(MarkDialogUnreadRequest(peer=InputDialogPeer(peer=peer), unread=True))
+    except Exception as e:
+        logger.warning("Mark unread failed: %s", e)
 
     _forwarded_times.append(datetime.now(timezone.utc).timestamp())
     await db.mark_forwarded(msg_id, bot_message_id, is_drift)

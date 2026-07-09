@@ -22,6 +22,8 @@ DRIFT_EVERY_N = int(os.environ.get("DRIFT_EVERY_N", "20"))
 DUPLICATE_JACCARD_THRESHOLD = float(os.environ.get("DUPLICATE_JACCARD_THRESHOLD", "0.5"))
 DUPLICATE_HOURS = int(os.environ.get("DUPLICATE_HOURS", "24"))
 
+UNKNOWN_CONCEPT_EPS = float(os.environ.get("UNKNOWN_CONCEPT_EPS", "0.01"))
+
 ALLOWED_USER_ID = int(os.environ["ALLOWED_USER_ID"])
 
 DEBUG_ALL_MESSAGES = os.environ.get("DEBUG_ALL_MESSAGES", "").lower() in ("1", "true", "yes")
