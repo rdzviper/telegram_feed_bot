@@ -52,6 +52,8 @@ async def process_message(event, tg_client: TelegramClient, bot: Bot):
     result = await analyzer.analyze(text)
     concepts = result["concepts"]
     is_ad = result["is_ad"]
+    informative = result["informative"]
+    has_media = bool(event.message.media)
 
     # локальный scoring по матрице весов
     weights = await db.get_concept_weights(concepts)
@@ -82,8 +84,8 @@ async def process_message(event, tg_client: TelegramClient, bot: Bot):
                 break
 
     logger.info(
-        "Analyzed: channel=%s concepts=%s local_score=%.1f threshold=%.1f is_ad=%s same_story=%s",
-        channel_name, concepts, local_score, threshold, is_ad, same_story,
+        "Analyzed: channel=%s concepts=%s local_score=%.1f threshold=%.1f is_ad=%s same_story=%s informative=%s media=%s",
+        channel_name, concepts, local_score, threshold, is_ad, same_story, informative, has_media,
     )
 
     try:
@@ -107,6 +109,10 @@ async def process_message(event, tg_client: TelegramClient, bot: Bot):
         return
     if same_story:
         logger.info("channel=%s filtered: duplicate story", channel_name)
+        return
+    # текстовый шум режем; пост с медиа пропускаем (картинка = контент)
+    if not informative and not has_media:
+        logger.info("channel=%s filtered: non-informative text", channel_name)
         return
 
     should_forward = local_score >= threshold
