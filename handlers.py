@@ -4,6 +4,7 @@ from telegram.ext import ContextTypes, CommandHandler, CallbackQueryHandler
 import database as db
 import analyzer
 import config
+import pipeline
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +75,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             delta = 1.0 if choice == "like" else -0.3
             await db.update_interests(concepts, delta=delta)
             logger.info("%s concepts=%s delta=%s", choice, concepts, delta)
+            # веса изменились — пересчитываем порог (единственный триггер)
+            await pipeline.refresh_threshold()
         label = "✅ Интересно" if choice == "like" else "❌ Не интересно"
         await query.answer(label)
 

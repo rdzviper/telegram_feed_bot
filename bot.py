@@ -9,6 +9,7 @@ from telegram.request import HTTPXRequest
 
 import config
 import database as db
+import pipeline
 from pipeline import process_message
 from handlers import register_handlers
 
@@ -23,6 +24,7 @@ async def main():
     os.makedirs(config.DATA_DIR, exist_ok=True)
     await db.init_db()
     logger.info("DB ready")
+    await pipeline.refresh_threshold()
 
     tg_client = TelegramClient(config.SESSION_PATH, config.TG_API_ID, config.TG_API_HASH)
 

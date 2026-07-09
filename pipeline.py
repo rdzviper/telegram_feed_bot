@@ -17,6 +17,16 @@ logger = logging.getLogger(__name__)
 _forwarded_times: deque = deque()
 _drift_counter = 0
 
+# порог кэшируется: пересчитывается только при старте и после голоса,
+# а не на каждом сообщении — иначе неоценённые посты самоусиливают порог
+_threshold = 0.0
+
+
+async def refresh_threshold():
+    global _threshold
+    _threshold = await db.get_adaptive_threshold()
+    logger.info("Threshold refreshed: %.3f", _threshold)
+
 
 
 def _rate_limit_ok() -> bool:
@@ -57,7 +67,7 @@ async def process_message(event, tg_client: TelegramClient, bot: Bot):
 
     # локальный scoring по матрице весов
     weights = await db.get_concept_weights(concepts)
-    threshold = await db.get_adaptive_threshold()
+    threshold = _threshold  # кэш; меняется только при голосовании
     # известные концепты берут свой вес; неизвестные делят порог между собой
     # (+эпсилон), чтобы пост целиком из новых тем всегда чуть перебивал порог
     # и не тонул со временем
