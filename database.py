@@ -76,6 +76,19 @@ async def upsert_channel(channel_id: int, channel_name: str):
         await db.commit()
 
 
+async def prune_channels(active_ids: set[int]) -> list[str]:
+    """Удаляет из channels все каналы, которых нет в active_ids (отписки).
+    Возвращает имена удалённых."""
+    async with aiosqlite.connect(config.DB_PATH) as db:
+        async with db.execute("SELECT channel_id, channel_name FROM channels") as cur:
+            rows = await cur.fetchall()
+        stale = [(cid, name) for cid, name in rows if cid not in active_ids]
+        for cid, _ in stale:
+            await db.execute("DELETE FROM channels WHERE channel_id = ?", (cid,))
+        await db.commit()
+        return [name for _, name in stale]
+
+
 async def is_channel_active(channel_id: int) -> bool:
     async with aiosqlite.connect(config.DB_PATH) as db:
         async with db.execute(

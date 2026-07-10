@@ -78,19 +78,23 @@ async def process_message(event, tg_client: TelegramClient, bot: Bot):
     )
     local_score = sum(weights.get(c, default_w) for c in concepts)
 
-    # дедупликация по Jaccard
+    # дедупликация по основной мысли: overlap coefficient |∩|/min(|A|,|B|)
+    # концепты сравниваем в нижнем регистре (убивает "Шаупель" vs "шаупель");
+    # требуем минимум 2 общих концепта, чтобы не ловить дубль по одному слову
     recent_concepts = await db.get_recent_forwarded_concepts(hours=config.DUPLICATE_HOURS)
-    current_set = set(concepts)
+    current_set = {c.lower() for c in concepts}
     same_story = False
-    if current_set:
+    if len(current_set) >= 2:
         for prev in recent_concepts:
-            prev_set = set(prev)
-            if not prev_set:
+            prev_set = {c.lower() for c in prev}
+            if len(prev_set) < 2:
                 continue
-            jaccard = len(current_set & prev_set) / len(current_set | prev_set)
-            if jaccard >= config.DUPLICATE_JACCARD_THRESHOLD:
+            inter = len(current_set & prev_set)
+            overlap = inter / min(len(current_set), len(prev_set))
+            if inter >= 2 and overlap >= config.DUPLICATE_OVERLAP_THRESHOLD:
                 same_story = True
-                logger.info("Duplicate detected: jaccard=%.2f concepts=%s", jaccard, concepts)
+                logger.info("Duplicate detected: overlap=%.2f inter=%d concepts=%s",
+                            overlap, inter, concepts)
                 break
 
     logger.info(

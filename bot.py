@@ -80,8 +80,16 @@ async def main():
     logger.info("Userbot connected")
 
     logger.info("Syncing dialogs...")
-    await tg_client.get_dialogs()
+    dialogs = await tg_client.get_dialogs()
     logger.info("Dialogs synced")
+
+    # чистим статистику каналов, от которых пользователь отписался
+    active_ids = {d.id for d in dialogs}
+    pruned = await db.prune_channels(active_ids)
+    if pruned:
+        logger.info("Pruned %d unsubscribed channels: %s", len(pruned), pruned)
+    else:
+        logger.info("No stale channels to prune")
 
     await bot.send_message(config.NOTIFY_CHAT_ID, "✅ Бот запущен, лайк +1, дизлайк -0.3")
 

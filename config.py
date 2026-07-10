@@ -19,7 +19,7 @@ DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.co
 RATE_LIMIT_PER_HOUR = int(os.environ.get("RATE_LIMIT_PER_HOUR", "20"))
 DRIFT_EVERY_N = int(os.environ.get("DRIFT_EVERY_N", "20"))
 
-DUPLICATE_JACCARD_THRESHOLD = float(os.environ.get("DUPLICATE_JACCARD_THRESHOLD", "0.5"))
+DUPLICATE_OVERLAP_THRESHOLD = float(os.environ.get("DUPLICATE_OVERLAP_THRESHOLD", "0.6"))
 DUPLICATE_HOURS = int(os.environ.get("DUPLICATE_HOURS", "24"))
 
 UNKNOWN_CONCEPT_EPS = float(os.environ.get("UNKNOWN_CONCEPT_EPS", "0.01"))
