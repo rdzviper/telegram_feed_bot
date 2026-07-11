@@ -8,10 +8,64 @@ import pipeline
 
 logger = logging.getLogger(__name__)
 
+# Telegram: 4096 симв/сообщение и 100 кнопок/клавиатуру. Держим запас,
+# иначе при большом числе каналов /stats падает с BadRequest.
+_MSG_CHAR_LIMIT = 3800
+_KB_ROW_LIMIT = 90
+_STATS_HEADER = "📊 <b>Каналы</b> (по рейтингу)\n\n"
+
 
 def _authorized(update: Update) -> bool:
     user = update.effective_user
     return user is not None and user.id == config.ALLOWED_USER_ID
+
+
+def _channel_line(ch: dict) -> str:
+    total = ch["likes"] + ch["dislikes"]
+    ratio = ch["likes"] / total if total > 0 else 0
+    filled = round(ratio * 5)
+    bar = "█" * filled + "░" * (5 - filled)
+    status = " ❌" if not ch["active"] else ""
+    return (
+        f"{bar} <b>{ch['channel_name']}</b>{status}\n"
+        f"  👍{ch['likes']} 👎{ch['dislikes']} · "
+        f"видел {ch['seen']} · слал {ch['forwarded']}"
+    )
+
+
+def _channel_button(ch: dict) -> InlineKeyboardButton:
+    label = f"{'✅' if ch['active'] else '❌'} {ch['channel_name']}"
+    return InlineKeyboardButton(label, callback_data=f"toggle:{ch['channel_id']}")
+
+
+def _render_stats_pages(channels: list[dict]) -> list[tuple[str, InlineKeyboardMarkup]]:
+    """Разбивает каналы на страницы под лимиты Telegram.
+
+    Возвращает список (text, keyboard). Каждая страница влезает и по символам,
+    и по числу кнопок — так /stats не падает при любом числе каналов.
+    """
+    pages: list[tuple[str, InlineKeyboardMarkup]] = []
+    lines: list[str] = []
+    buttons: list[list[InlineKeyboardButton]] = []
+    length = len(_STATS_HEADER)
+
+    def flush():
+        if lines:
+            pages.append(
+                (_STATS_HEADER + "\n\n".join(lines), InlineKeyboardMarkup(buttons))
+            )
+
+    for ch in channels:
+        line = _channel_line(ch)
+        extra = len(line) + 2  # разделитель "\n\n"
+        if lines and (length + extra > _MSG_CHAR_LIMIT or len(buttons) >= _KB_ROW_LIMIT):
+            flush()
+            lines, buttons, length = [], [], len(_STATS_HEADER)
+        lines.append(line)
+        buttons.append([_channel_button(ch)])
+        length += extra
+    flush()
+    return pages
 
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -22,29 +76,10 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Нет данных — бот ещё не видел сообщений.")
         return
 
-    lines = []
-    keyboard = []
-    for ch in channels:
-        total = ch["likes"] + ch["dislikes"]
-        ratio = ch["likes"] / total if total > 0 else 0
-        bar = "█" * round(ratio * 5) + "░" * (5 - round(ratio * 5))
-        status = " ❌" if not ch["active"] else ""
-        lines.append(
-            f"{bar} <b>{ch['channel_name']}</b>{status}\n"
-            f"  👍{ch['likes']} 👎{ch['dislikes']} · "
-            f"видел {ch['seen']} · слал {ch['forwarded']}"
+    for text, keyboard in _render_stats_pages(channels):
+        await update.message.reply_text(
+            text, parse_mode="HTML", reply_markup=keyboard
         )
-        btn_label = f"{'✅' if ch['active'] else '❌'} {ch['channel_name']}"
-        keyboard.append([
-            InlineKeyboardButton(btn_label, callback_data=f"toggle:{ch['channel_id']}")
-        ])
-
-    text = "📊 <b>Каналы</b> (по рейтингу)\n\n" + "\n\n".join(lines)
-    await update.message.reply_text(
-        text,
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
 
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -102,29 +137,23 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         new_state = await db.toggle_channel(channel_id)
         status = "включён ✅" if new_state else "отключён ❌"
         await query.answer(status, show_alert=True)
-        # обновляем сообщение со статистикой
-        channels = await db.get_channels_stats()
-        lines = []
-        keyboard = []
-        for ch in channels:
-            total = ch["likes"] + ch["dislikes"]
-            ratio = ch["likes"] / total if total > 0 else 0
-            bar = "█" * round(ratio * 5) + "░" * (5 - round(ratio * 5))
-            ch_status = " ❌" if not ch["active"] else ""
-            lines.append(
-                f"{bar} <b>{ch['channel_name']}</b>{ch_status}\n"
-                f"  👍{ch['likes']} 👎{ch['dislikes']} · "
-                f"видел {ch['seen']} · слал {ch['forwarded']}"
-            )
-            btn_label = f"{'✅' if ch['active'] else '❌'} {ch['channel_name']}"
-            keyboard.append([
-                InlineKeyboardButton(btn_label, callback_data=f"toggle:{ch['channel_id']}")
-            ])
+        # Стата может быть разбита на несколько сообщений — не ре-рендерим всё
+        # (это и роняло /stats). Обновляем только кнопку в ЭТОМ сообщении.
+        old_rows = query.message.reply_markup.inline_keyboard if query.message.reply_markup else []
+        new_rows = []
+        for row in old_rows:
+            new_row = []
+            for btn in row:
+                if btn.callback_data == data:
+                    name = btn.text.split(" ", 1)[1] if " " in btn.text else btn.text
+                    new_label = f"{'✅' if new_state else '❌'} {name}"
+                    new_row.append(InlineKeyboardButton(new_label, callback_data=data))
+                else:
+                    new_row.append(btn)
+            new_rows.append(new_row)
         try:
-            await query.edit_message_text(
-                text="📊 <b>Каналы</b> (по рейтингу)\n\n" + "\n\n".join(lines),
-                parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup(keyboard),
+            await query.edit_message_reply_markup(
+                reply_markup=InlineKeyboardMarkup(new_rows)
             )
         except Exception:
             pass
