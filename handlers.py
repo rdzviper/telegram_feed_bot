@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 # иначе при большом числе каналов /stats падает с BadRequest.
 _MSG_CHAR_LIMIT = 3800
 _KB_ROW_LIMIT = 90
-_STATS_HEADER = "📊 <b>Каналы</b> (по рейтингу)\n\n"
+_STATS_HEADER = "📊 <b>Каналы</b> (А→Я)\n\n"
 
 
 def _authorized(update: Update) -> bool:
@@ -76,6 +76,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Нет данных — бот ещё не видел сообщений.")
         return
 
+    channels.sort(key=lambda c: c["channel_name"].casefold())
     for text, keyboard in _render_stats_pages(channels):
         await update.message.reply_text(
             text, parse_mode="HTML", reply_markup=keyboard
