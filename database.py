@@ -43,6 +43,13 @@ CREATE TABLE IF NOT EXISTS interests (
     topic TEXT PRIMARY KEY,
     weight REAL DEFAULT 0.0
 );
+
+CREATE TABLE IF NOT EXISTS topic_votes (
+    msg_id INTEGER NOT NULL,
+    topic_idx INTEGER NOT NULL,
+    choice TEXT NOT NULL,
+    PRIMARY KEY (msg_id, topic_idx)
+);
 """
 
 _MIGRATIONS = [
@@ -228,6 +235,27 @@ async def update_interests(topics: list[str], delta: float = 1.0):
                 "UPDATE interests SET weight = weight + ? WHERE topic = ?", (delta, topic)
             )
         await db.commit()
+
+
+async def get_topic_votes(msg_id: int) -> dict[int, str]:
+    """Голоса по топикам поста: {topic_idx: 'like'|'dislike'}."""
+    async with aiosqlite.connect(config.DB_PATH) as db:
+        async with db.execute(
+            "SELECT topic_idx, choice FROM topic_votes WHERE msg_id = ?", (msg_id,)
+        ) as cur:
+            return {row[0]: row[1] for row in await cur.fetchall()}
+
+
+async def add_topic_vote(msg_id: int, topic_idx: int, choice: str) -> bool:
+    """Записывает голос по топику. True — голос новый (применить вес),
+    False — по этому топику уже голосовали (идемпотентность, вес не трогаем)."""
+    async with aiosqlite.connect(config.DB_PATH) as db:
+        cur = await db.execute(
+            "INSERT OR IGNORE INTO topic_votes (msg_id, topic_idx, choice) VALUES (?, ?, ?)",
+            (msg_id, topic_idx, choice),
+        )
+        await db.commit()
+        return cur.rowcount > 0
 
 
 async def get_interests(limit: int = 30) -> list[tuple[str, float]]:

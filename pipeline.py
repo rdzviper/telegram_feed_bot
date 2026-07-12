@@ -152,10 +152,9 @@ async def process_message(event, tg_client: TelegramClient, bot: Bot):
     logger.info("Forwarding: channel=%s local_score=%.1f threshold=%.1f drift=%s",
                 channel_name, local_score, threshold, is_drift)
 
-    # подпись с разбивкой концептов ушла в меню оценки: под постом одна кнопка
-    # «Оценить», которая раскрывается в пер-топиковый лайк/дизлайк
-    prefix = "🔍 " if is_drift else ""
-    vote_text = f"{prefix}Σ <b>{local_score:.2f}</b>/{threshold:.2f}"
+    # под постом — только кнопка «Оценить», без текста. Telegram требует
+    # непустой текст, поэтому zero-width space (кнопка раскрывает меню топиков)
+    vote_text = "\u200b"
 
     keyboard = InlineKeyboardMarkup(
         [[InlineKeyboardButton("🗳 Оценить", callback_data=f"rate:{msg_id}")]]
