@@ -11,7 +11,7 @@ import config
 import database as db
 import pipeline
 from pipeline import process_message
-from handlers import register_handlers
+from handlers import register_handlers, set_bot_commands
 
 logging.basicConfig(
     format="%(asctime)s %(name)-20s %(levelname)s %(message)s",
@@ -72,6 +72,7 @@ async def main():
     register_handlers(application)
 
     await application.initialize()
+    await set_bot_commands(application)
     await application.start()
     await application.updater.start_polling()
     logger.info("Bot polling started")

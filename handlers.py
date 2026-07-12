@@ -1,5 +1,5 @@
 import logging
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import ContextTypes, CommandHandler, CallbackQueryHandler
 import database as db
 import analyzer
@@ -187,6 +187,17 @@ async def error_handler(update, context):
         logger.warning("Telegram network error: %s", err)
     else:
         logger.error("Unhandled telegram error", exc_info=err)
+
+
+BOT_COMMANDS = [
+    BotCommand("stats", "Статистика каналов"),
+    BotCommand("channels", "Управление каналами (вкл/выкл)"),
+]
+
+
+async def set_bot_commands(application):
+    """Регистрирует меню команд бота (кнопка «/» в клиенте Telegram)."""
+    await application.bot.set_my_commands(BOT_COMMANDS)
 
 
 def register_handlers(application):
