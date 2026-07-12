@@ -152,29 +152,14 @@ async def process_message(event, tg_client: TelegramClient, bot: Bot):
     logger.info("Forwarding: channel=%s local_score=%.1f threshold=%.1f drift=%s",
                 channel_name, local_score, threshold, is_drift)
 
-    username = getattr(event.chat, "username", None)
-    if username:
-        post_link = f"https://t.me/{username}/{event.message.id}"
-    else:
-        bare_id = str(abs(event.chat_id))[3:]
-        post_link = f"https://t.me/c/{bare_id}/{event.message.id}"
-
+    # подпись с разбивкой концептов ушла в меню оценки: под постом одна кнопка
+    # «Оценить», которая раскрывается в пер-топиковый лайк/дизлайк
     prefix = "🔍 " if is_drift else ""
-    header = f'{prefix}<a href="{post_link}">{html.escape(channel_name)}</a>'
+    vote_text = f"{prefix}Σ <b>{local_score:.2f}</b>/{threshold:.2f}"
 
-    concept_parts = []
-    for c in concepts:
-        w = weights.get(c, default_w)
-        concept_parts.append(f"{html.escape(c)} {w:+.2f}")
-    score_line = "  ·  ".join(concept_parts)
-    vote_text = f"{score_line} Σ <b>{local_score:.2f}</b>/{threshold:.2f}"
-
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("👍", callback_data=f"like:{msg_id}"),
-            InlineKeyboardButton("👎", callback_data=f"dislike:{msg_id}"),
-        ]
-    ])
+    keyboard = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("🗳 Оценить", callback_data=f"rate:{msg_id}")]]
+    )
 
     bot_message_id = None
     try:

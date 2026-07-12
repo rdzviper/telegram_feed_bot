@@ -39,6 +39,35 @@ def _channel_button(ch: dict) -> InlineKeyboardButton:
     return InlineKeyboardButton(label, callback_data=f"toggle:{ch['channel_id']}")
 
 
+# --- меню оценки поста по топикам ---
+# Состояние живёт в БД (concepts по msg_id) и в самой клавиатуре сообщения —
+# в процессе ничего не копится, память не течёт.
+_TOPIC_LABEL_MAX = 24
+
+
+def _trunc(topic: str) -> str:
+    return topic if len(topic) <= _TOPIC_LABEL_MAX else topic[: _TOPIC_LABEL_MAX - 1] + "…"
+
+
+def _topics_keyboard(msg_id: int, concepts: list[str]) -> InlineKeyboardMarkup:
+    """Строка на топик: [топик][👍][👎]. Топик усечён — 👍/👎 выравниваются в колонки."""
+    rows = [
+        [
+            InlineKeyboardButton(_trunc(topic), callback_data="noop"),
+            InlineKeyboardButton("👍", callback_data=f"tl:{msg_id}:{i}"),
+            InlineKeyboardButton("👎", callback_data=f"td:{msg_id}:{i}"),
+        ]
+        for i, topic in enumerate(concepts)
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+def _voted_row(topic: str, choice: str) -> list[InlineKeyboardButton]:
+    """Оценённый топик: одна кнопка [✅/❌ топик], кнопки лайков убраны."""
+    mark = "✅" if choice == "like" else "❌"
+    return [InlineKeyboardButton(f"{mark} {_trunc(topic)}", callback_data="noop")]
+
+
 def _render_stats_pages(channels: list[dict]) -> list[str]:
     """Текстовые страницы статистики (без кнопок), разбитые под лимит 4096 симв."""
     pages: list[str] = []
@@ -106,48 +135,63 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     data = query.data
 
-    if data.startswith(("like:", "dislike:")):
-        choice, msg_id_str = data.split(":", 1)
-        msg_id = int(msg_id_str)
-
-        # защита от повторного голосования
-        prev = await db.get_user_choice(msg_id)
-        if prev:
-            await query.answer("Уже оценено")
+    if data.startswith("rate:"):
+        # «Оценить» → раскрываем список топиков с лайк/дизлайк
+        msg_id = int(data.split(":", 1)[1])
+        concepts = await db.get_message_concepts(msg_id)
+        if not concepts:
+            await query.answer("Нет топиков для оценки", show_alert=True)
             try:
                 await query.edit_message_reply_markup(reply_markup=None)
             except Exception:
                 pass
             return
-
-        await db.set_user_choice(msg_id, choice)
-        await db.increment_channel_vote(msg_id, choice)
-        concepts = await db.get_message_concepts(msg_id)
-        if concepts:
-            delta = 1.0 if choice == "like" else -0.3
-            await db.update_interests(concepts, delta=delta)
-            logger.info("%s concepts=%s delta=%s", choice, concepts, delta)
-            # веса изменились — пересчитываем порог (единственный триггер)
-            await pipeline.refresh_threshold()
-        label = "✅ Интересно" if choice == "like" else "❌ Не интересно"
-        await query.answer(label)
-
-        # медиа-пост несёт caption, текстовый — text; убираем кнопки после голоса
+        await query.answer()
         try:
-            if query.message.caption is not None:
-                await query.edit_message_caption(
-                    caption=f"{query.message.caption_html}\n{label}",
-                    parse_mode="HTML",
-                    reply_markup=None,
-                )
-            else:
-                await query.edit_message_text(
-                    text=f"{query.message.text_html}\n{label}",
-                    parse_mode="HTML",
-                    reply_markup=None,
-                )
+            await query.edit_message_reply_markup(
+                reply_markup=_topics_keyboard(msg_id, concepts)
+            )
         except Exception as e:
-            logger.error("edit after vote failed: %s", e)
+            logger.error("rate expand failed: %s", e)
+
+    elif data.startswith(("tl:", "td:")):
+        # голос по одному топику: правим вес точечно, помечаем строку, убираем кнопки
+        kind, msg_id_str, idx_str = data.split(":")
+        msg_id, idx = int(msg_id_str), int(idx_str)
+        choice = "like" if kind == "tl" else "dislike"
+
+        concepts = await db.get_message_concepts(msg_id)
+        if idx >= len(concepts):
+            await query.answer("Устарело", show_alert=True)
+            return
+        topic = concepts[idx]
+
+        # перестраиваем клавиатуру из текущей: меняем только нажатую строку.
+        # если кнопок этого топика уже нет — значит уже оценён (идемпотентность)
+        old_rows = query.message.reply_markup.inline_keyboard if query.message.reply_markup else []
+        new_rows, found = [], False
+        for row in old_rows:
+            if any(b.callback_data == data for b in row):
+                found = True
+                new_rows.append(_voted_row(topic, choice))
+            else:
+                new_rows.append(list(row))
+        if not found:
+            await query.answer("Уже оценено")
+            return
+
+        delta = 1.0 if choice == "like" else -0.3
+        await db.update_interests([topic], delta=delta)
+        await db.increment_channel_vote(msg_id, choice)
+        await pipeline.refresh_threshold()
+        logger.info("topic %s %r delta=%s", choice, topic, delta)
+        await query.answer("👍 +1.0" if choice == "like" else "👎 −0.3")
+        try:
+            await query.edit_message_reply_markup(
+                reply_markup=InlineKeyboardMarkup(new_rows)
+            )
+        except Exception as e:
+            logger.error("topic vote edit failed: %s", e)
 
     elif data.startswith("toggle:"):
         channel_id = int(data.split(":", 1)[1])
