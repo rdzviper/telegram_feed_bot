@@ -20,7 +20,7 @@ _ANALYZE_PROMPT = """\
 {{"concepts": ["концепт1", ...], "is_ad": false, "informative": true}}
 
 Правила:
-- concepts: 3-7 ключевых концептов. Форма: именительный падеж, ед. число.
+- concepts: ровно {n} ключевых концептов (можно меньше, только если значимых в тексте реально меньше). Форма: именительный падеж, ед. число.
 - КАНОНИЗАЦИЯ (критично для сравнения постов): один и тот же объект ВСЕГДА должен давать одну и ту же строку, независимо от того, как он назван в тексте. Приводи к самой узнаваемой общепринятой форме:
   • Аббревиатура и полное название → одна форма: "Counter-Strike 2" и "CS2" → "CS2"; "искусственный интеллект" и "ИИ" → "ИИ"; "Playstation 5" и "PS5" → "PS5".
   • Убирай уточнения, порядковые номера, эпитеты — до базового существительного: "собаки-заложники" → "собака"; "5-й сезон Premier" → "сезон Premier"; "бездомный кот" → "кот".
@@ -40,12 +40,43 @@ _CALL_KWARGS = dict(
     extra_body={"thinking": {"type": "disabled"}},
 )
 
+_WORDS_PER_CONCEPT = 20
+_MAX_CONCEPTS = 10
+
+# Короткий пост (≤5 слов) в DeepSeek не шлём: каждое слово поста — топик,
+# берём только слова длиннее 3 символов.
+_SHORT_POST_MAX_WORDS = 5
+_MIN_TOPIC_LEN = 3
+_PUNCT = "«»\"'“”„.,!?;:()[]{}—–-…*_`"
+
+
+def target_concept_count(text: str) -> int:
+    """Сколько концептов просить: 1 на 20 слов, зажато в [1, 10]."""
+    words = len(text.split())
+    return max(1, min(_MAX_CONCEPTS, round(words / _WORDS_PER_CONCEPT)))
+
+
+def _short_post_concepts(text: str) -> list[str]:
+    """Топики короткого поста: каждое слово длиннее 3 символов (без дублей, порядок сохранён)."""
+    concepts = []
+    for w in text.split():
+        cw = w.strip(_PUNCT)
+        if len(cw) > _MIN_TOPIC_LEN:
+            concepts.append(cw)
+    return list(dict.fromkeys(concepts))
 
 
 async def analyze(text: str) -> dict:
-    prompt = _ANALYZE_PROMPT.format(text=text[:1500])
+    words = text.split()
+    if len(words) <= _SHORT_POST_MAX_WORDS:
+        concepts = _short_post_concepts(text)
+        logger.debug("Short post (%d words), skip DeepSeek, concepts=%s", len(words), concepts)
+        return {"concepts": concepts, "is_ad": False, "informative": True}
+
+    n = target_concept_count(text)
+    prompt = _ANALYZE_PROMPT.format(text=text[:1500], n=n)
     try:
-        logger.debug("Calling DeepSeek model=%s prompt_len=%d", config.DEEPSEEK_MODEL, len(prompt))
+        logger.debug("Calling DeepSeek model=%s n=%d prompt_len=%d", config.DEEPSEEK_MODEL, n, len(prompt))
         response = await _client.chat.completions.create(
             messages=[{"role": "user", "content": prompt}],
             max_tokens=150,
@@ -58,7 +89,7 @@ async def analyze(text: str) -> dict:
             return {"concepts": [], "is_ad": False, "informative": True}
         raw = json.loads(content)
         return {
-            "concepts": [str(c) for c in raw.get("concepts", [])][:7],
+            "concepts": [str(c) for c in raw.get("concepts", [])][:n],
             "is_ad": bool(raw.get("is_ad", False)),
             "informative": bool(raw.get("informative", True)),
         }
