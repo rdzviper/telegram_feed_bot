@@ -7,4 +7,4 @@ services:
     volumes:
       - ./data:/app/data
     mem_limit: 256m
-    # network_mode: bridge  (default, не трогаем роутинг OpenWrt)
+    # network_mode: bridge
