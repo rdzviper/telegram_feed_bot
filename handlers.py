@@ -42,7 +42,7 @@ def _channel_button(ch: dict) -> InlineKeyboardButton:
 # --- меню оценки поста по топикам ---
 # Состояние живёт в БД (concepts по msg_id) и в самой клавиатуре сообщения —
 # в процессе ничего не копится, память не течёт.
-_TOPIC_LABEL_MAX = 24
+_TOPIC_LABEL_MAX = 40  # топик на всю ширину строки
 
 
 def _trunc(topic: str) -> str:
@@ -70,8 +70,9 @@ def _topics_keyboard(msg_id: int, concepts: list[str], votes: dict[int, str]) ->
         if i in votes:
             rows.append(_voted_row(topic, votes[i]))
         else:
+            # топик на всю ширину своей строкой, 👍/👎 — строкой под ним
+            rows.append([InlineKeyboardButton(_trunc(topic), callback_data="noop")])
             rows.append([
-                InlineKeyboardButton(_trunc(topic), callback_data="noop"),
                 InlineKeyboardButton("👍", callback_data=f"tl:{msg_id}:{i}"),
                 InlineKeyboardButton("👎", callback_data=f"td:{msg_id}:{i}"),
             ])
