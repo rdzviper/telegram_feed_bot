@@ -9,10 +9,11 @@ import pipeline
 logger = logging.getLogger(__name__)
 
 # Telegram: 4096 симв/сообщение и 100 кнопок/клавиатуру. Держим запас,
-# иначе при большом числе каналов /stats падает с BadRequest.
+# иначе при большом числе каналов команды падают с BadRequest.
 _MSG_CHAR_LIMIT = 3800
 _KB_ROW_LIMIT = 90
-_STATS_HEADER = "📊 <b>Каналы</b> (А→Я)\n\n"
+_STATS_HEADER = "📊 <b>Статистика каналов</b> (А→Я)\n\n"
+_CHANNELS_HEADER = "🎛 <b>Управление каналами</b> (А→Я)\nНажми, чтобы включить/отключить.\n\n"
 
 
 def _authorized(update: Update) -> bool:
@@ -38,33 +39,35 @@ def _channel_button(ch: dict) -> InlineKeyboardButton:
     return InlineKeyboardButton(label, callback_data=f"toggle:{ch['channel_id']}")
 
 
-def _render_stats_pages(channels: list[dict]) -> list[tuple[str, InlineKeyboardMarkup]]:
-    """Разбивает каналы на страницы под лимиты Telegram.
-
-    Возвращает список (text, keyboard). Каждая страница влезает и по символам,
-    и по числу кнопок — так /stats не падает при любом числе каналов.
-    """
-    pages: list[tuple[str, InlineKeyboardMarkup]] = []
+def _render_stats_pages(channels: list[dict]) -> list[str]:
+    """Текстовые страницы статистики (без кнопок), разбитые под лимит 4096 симв."""
+    pages: list[str] = []
     lines: list[str] = []
-    buttons: list[list[InlineKeyboardButton]] = []
     length = len(_STATS_HEADER)
-
-    def flush():
-        if lines:
-            pages.append(
-                (_STATS_HEADER + "\n\n".join(lines), InlineKeyboardMarkup(buttons))
-            )
-
     for ch in channels:
         line = _channel_line(ch)
         extra = len(line) + 2  # разделитель "\n\n"
-        if lines and (length + extra > _MSG_CHAR_LIMIT or len(buttons) >= _KB_ROW_LIMIT):
-            flush()
-            lines, buttons, length = [], [], len(_STATS_HEADER)
+        if lines and length + extra > _MSG_CHAR_LIMIT:
+            pages.append(_STATS_HEADER + "\n\n".join(lines))
+            lines, length = [], len(_STATS_HEADER)
         lines.append(line)
-        buttons.append([_channel_button(ch)])
         length += extra
-    flush()
+    if lines:
+        pages.append(_STATS_HEADER + "\n\n".join(lines))
+    return pages
+
+
+def _render_channel_pages(channels: list[dict]) -> list[tuple[str, InlineKeyboardMarkup]]:
+    """Страницы управления: заголовок + кнопки-тумблеры, разбитые под лимит 100 кнопок."""
+    pages: list[tuple[str, InlineKeyboardMarkup]] = []
+    buttons: list[list[InlineKeyboardButton]] = []
+    for ch in channels:
+        if len(buttons) >= _KB_ROW_LIMIT:
+            pages.append((_CHANNELS_HEADER, InlineKeyboardMarkup(buttons)))
+            buttons = []
+        buttons.append([_channel_button(ch)])
+    if buttons:
+        pages.append((_CHANNELS_HEADER, InlineKeyboardMarkup(buttons)))
     return pages
 
 
@@ -77,7 +80,20 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     channels.sort(key=lambda c: c["channel_name"].casefold())
-    for text, keyboard in _render_stats_pages(channels):
+    for text in _render_stats_pages(channels):
+        await update.message.reply_text(text, parse_mode="HTML")
+
+
+async def channels_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _authorized(update):
+        return
+    channels = await db.get_channels_stats()
+    if not channels:
+        await update.message.reply_text("Нет каналов — бот ещё не синхронизировал диалоги.")
+        return
+
+    channels.sort(key=lambda c: c["channel_name"].casefold())
+    for text, keyboard in _render_channel_pages(channels):
         await update.message.reply_text(
             text, parse_mode="HTML", reply_markup=keyboard
         )
@@ -138,8 +154,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         new_state = await db.toggle_channel(channel_id)
         status = "включён ✅" if new_state else "отключён ❌"
         await query.answer(status, show_alert=True)
-        # Стата может быть разбита на несколько сообщений — не ре-рендерим всё
-        # (это и роняло /stats). Обновляем только кнопку в ЭТОМ сообщении.
+        # /channels может быть разбит на несколько сообщений — не ре-рендерим всё.
+        # Обновляем только кнопку в ЭТОМ сообщении.
         old_rows = query.message.reply_markup.inline_keyboard if query.message.reply_markup else []
         new_rows = []
         for row in old_rows:
@@ -175,5 +191,6 @@ async def error_handler(update, context):
 
 def register_handlers(application):
     application.add_handler(CommandHandler("stats", stats_command))
+    application.add_handler(CommandHandler("channels", channels_command))
     application.add_handler(CallbackQueryHandler(button_callback))
     application.add_error_handler(error_handler)
