@@ -154,7 +154,8 @@ async def process_message(event, tg_client: TelegramClient, bot: Bot):
 
     # под постом — только кнопка «Оценить», без текста. Telegram требует
     # непустой текст, поэтому zero-width space (кнопка раскрывает меню топиков)
-    vote_text = "\u200b"
+    prefix = "🔍 " if is_drift else ""
+    vote_text = f"{prefix}Σ <b>{local_score:.2f}</b>/{threshold:.2f}"
 
     keyboard = InlineKeyboardMarkup(
         [[InlineKeyboardButton("🗳 Оценить", callback_data=f"rate:{msg_id}")]]
