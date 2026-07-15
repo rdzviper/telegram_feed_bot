@@ -55,6 +55,8 @@ CREATE TABLE IF NOT EXISTS topic_votes (
 _MIGRATIONS = [
     "ALTER TABLE messages ADD COLUMN concepts TEXT",
     "ALTER TABLE messages ADD COLUMN local_score REAL",
+    "ALTER TABLE messages ADD COLUMN summary TEXT",
+    "ALTER TABLE messages ADD COLUMN embedding BLOB",
 ]
 
 
@@ -174,6 +176,29 @@ async def mark_forwarded(msg_id: int, bot_message_id: int | None, is_drift: bool
             (bot_message_id, int(is_drift), msg_id),
         )
         await db.commit()
+
+
+async def save_message_semantic(msg_id: int, summary: str, embedding: bytes | None):
+    """Сохраняет саммари и вектор поста (для семантического дедупа A1)."""
+    async with aiosqlite.connect(config.DB_PATH) as db:
+        await db.execute(
+            "UPDATE messages SET summary = ?, embedding = ? WHERE id = ?",
+            (summary, embedding, msg_id),
+        )
+        await db.commit()
+
+
+async def get_recent_forwarded_embeddings(hours: int = 24) -> list[bytes]:
+    """BLOB'ы векторов пересланных постов за окно (для cosine-дедупа)."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    async with aiosqlite.connect(config.DB_PATH) as db:
+        async with db.execute(
+            """SELECT embedding FROM messages
+               WHERE forwarded = 1 AND embedding IS NOT NULL AND created_at > ?
+               ORDER BY created_at DESC""",
+            (cutoff,),
+        ) as cur:
+            return [r[0] for r in await cur.fetchall()]
 
 
 async def get_recent_forwarded_concepts(hours: int = 24) -> list[list[str]]:

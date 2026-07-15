@@ -22,6 +22,14 @@ DRIFT_EVERY_N = int(os.environ.get("DRIFT_EVERY_N", "20"))
 DUPLICATE_OVERLAP_THRESHOLD = float(os.environ.get("DUPLICATE_OVERLAP_THRESHOLD", "0.6"))
 DUPLICATE_HOURS = int(os.environ.get("DUPLICATE_HOURS", "24"))
 
+# --- Семантический дедуп (эмбеддинги саммари, A1) ---
+EMBEDDING_API_KEY = os.environ.get("EMBEDDING_API_KEY", "")
+EMBEDDING_BASE_URL = os.environ.get("EMBEDDING_BASE_URL", "https://api.openai.com/v1")
+EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "text-embedding-3-small")
+EMBEDDING_DIM = int(os.environ.get("EMBEDDING_DIM", "512"))
+# старт строгий (высокий): дубли допустимы поначалу, лишь бы не склеивать разные новости; снижаем по мере уверенности
+DUPLICATE_COSINE_THRESHOLD = float(os.environ.get("DUPLICATE_COSINE_THRESHOLD", "0.88"))
+
 UNKNOWN_CONCEPT_EPS = float(os.environ.get("UNKNOWN_CONCEPT_EPS", "0.01"))
 
 ALLOWED_USER_ID = int(os.environ["ALLOWED_USER_ID"])
