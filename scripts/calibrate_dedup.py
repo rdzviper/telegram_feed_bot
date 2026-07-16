@@ -98,18 +98,44 @@ async def main():
     print(f"\nmin(внутри)={min_within:.3f}  max(между)={max_cross:.3f}  "
           f"зазор={min_within - max_cross:+.3f}")
 
-    print("\nτ      recall(дубли)  false-merge(разное)")
+    print("\n[справочно] все ПАРЫ внутри кластера:")
+    print("τ      recall(пары)  false-merge(разное)")
     for tau in SWEEP:
         rec = sum(1 for c, _, _ in within if c >= tau) / len(within)
         fp = sum(1 for c, _, _ in cross if c >= tau) / len(cross)
-        print(f"{tau:.2f}   {rec:6.0%}          {fp:6.0%}")
+        print(f"{tau:.2f}   {rec:6.0%}         {fp:6.0%}")
 
-    # рекомендация: самый высокий τ с нулём ложных склеек, максимизирующий recall
+    # реальное поведение: дубль сравнивается только с уже ПЕРЕСЛАННЫМИ постами.
+    # пойманный дубль подавляется и якорем НЕ становится (как в пайплайне).
+    from collections import OrderedDict
+    clusters = OrderedDict()
+    for idx, (cl, _, _) in enumerate(labels):
+        clusters.setdefault(cl, []).append(idx)
+
+    def seq_coverage(tau: float) -> float:
+        caught = tot = 0
+        for idxs in clusters.values():
+            anchors = [idxs[0]]  # первый пост кластера всегда форвардится
+            for k in idxs[1:]:
+                tot += 1
+                best = max(float(vecs[k] @ vecs[a]) for a in anchors)
+                if best >= tau:
+                    caught += 1
+                else:
+                    anchors.append(k)  # не пойман → форвардится → новый якорь
+        return caught / tot if tot else 0.0
+
+    print("\n[реальное] ПОСЛЕДОВАТЕЛЬНЫЙ охват (сравнение с уже пересланными):")
+    print("τ      охват дублей  ложные склейки")
+    for tau in SWEEP:
+        fp = sum(1 for c, _, _ in cross if c >= tau) / len(cross)
+        print(f"{tau:.2f}   {seq_coverage(tau):6.0%}        {fp:6.0%}")
+
     safe = [t for t in SWEEP if all(c < t for c, _, _ in cross)]
     if safe:
-        rec = sum(1 for c, _, _ in within if c >= min(safe)) / len(within)
-        print(f"\nРекоменд. старт (строгий, 0 ложных склеек): τ={min(safe):.2f} "
-              f"→ ловит {rec:.0%} дублей. Снижать по мере уверенности.")
+        tau = min(safe)
+        print(f"\nРекоменд. старт (строгий, 0 ложных склеек): τ={tau:.2f} "
+              f"→ последоват. охват {seq_coverage(tau):.0%}. Снижать по мере уверенности.")
     else:
         print("\nНет τ из сетки с нулём ложных склеек — сет пересекается, смотреть пары выше.")
 

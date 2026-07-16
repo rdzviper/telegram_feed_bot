@@ -1,5 +1,6 @@
 import html
 import logging
+import re
 from collections import deque
 from datetime import datetime, timezone
 
@@ -11,8 +12,29 @@ from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 import config
 import database as db
 import analyzer
+import embeddings
 
 logger = logging.getLogger(__name__)
+
+_URL_RE = re.compile(r"https?://\S+|t\.me/\S+")
+_NONWORD_RE = re.compile(r"[^\w\s]", re.UNICODE)
+
+
+def _norm_tokens(t: str) -> set[str]:
+    t = _URL_RE.sub(" ", t.lower().replace("ё", "е"))
+    return {w for w in _NONWORD_RE.sub(" ", t).split() if len(w) > 2}
+
+
+def _is_text_duplicate(text: str, recent_texts: list[str], threshold: float = 0.9) -> bool:
+    """Дешёвый слой 0: ловит побайтовые/почти-побайтовые репосты по overlap токенов."""
+    cur = _norm_tokens(text)
+    if len(cur) < 3:
+        return False
+    for prev in recent_texts:
+        p = _norm_tokens(prev)
+        if len(p) >= 3 and len(cur & p) / min(len(cur), len(p)) >= threshold:
+            return True
+    return False
 
 _forwarded_times: deque = deque()
 _drift_counter = 0
@@ -78,24 +100,26 @@ async def process_message(event, tg_client: TelegramClient, bot: Bot):
     )
     local_score = sum(weights.get(c, default_w) for c in concepts)
 
-    # дедупликация по основной мысли: overlap coefficient |∩|/min(|A|,|B|)
-    # концепты сравниваем в нижнем регистре (убивает "Шаупель" vs "шаупель");
-    # требуем минимум 2 общих концепта, чтобы не ловить дубль по одному слову
-    recent_concepts = await db.get_recent_forwarded_concepts(hours=config.DUPLICATE_HOURS)
-    current_set = {c.lower() for c in concepts}
+    # --- Дедуп: слой 0 (текст, verbatim) + слой 1 (cosine саммари, смысл) ---
+    summary = result.get("summary", "")
     same_story = False
-    if len(current_set) >= 2:
-        for prev in recent_concepts:
-            prev_set = {c.lower() for c in prev}
-            if len(prev_set) < 2:
-                continue
-            inter = len(current_set & prev_set)
-            overlap = inter / min(len(current_set), len(prev_set))
-            if inter >= 2 and overlap >= config.DUPLICATE_OVERLAP_THRESHOLD:
-                same_story = True
-                logger.info("Duplicate detected: overlap=%.2f inter=%d concepts=%s",
-                            overlap, inter, concepts)
-                break
+
+    recent_texts = await db.get_recent_forwarded_texts(hours=config.DUPLICATE_HOURS)
+    if _is_text_duplicate(text, recent_texts):
+        same_story = True
+        logger.info("Duplicate (text pre-filter): channel=%s", channel_name)
+
+    embedding = await embeddings.embed(summary)
+    if not same_story and embedding is not None:
+        best = 0.0
+        for blob in await db.get_recent_forwarded_embeddings(hours=config.DUPLICATE_HOURS):
+            cos = float(embedding @ embeddings.from_blob(blob))
+            if cos > best:
+                best = cos
+        if best >= config.DUPLICATE_COSINE_THRESHOLD:
+            same_story = True
+            logger.info("Duplicate (cosine=%.3f ≥ %.2f): channel=%s summary=%.80r",
+                        best, config.DUPLICATE_COSINE_THRESHOLD, channel_name, summary)
 
     logger.info(
         "Analyzed: channel=%s concepts=%s local_score=%.1f threshold=%.1f is_ad=%s same_story=%s informative=%s media=%s",
@@ -114,6 +138,9 @@ async def process_message(event, tg_client: TelegramClient, bot: Bot):
             same_story=same_story,
         )
         await db.save_message_concepts(msg_id, concepts, local_score)
+        await db.save_message_semantic(
+            msg_id, summary, embeddings.to_blob(embedding) if embedding is not None else None
+        )
     except Exception as e:
         logger.error("DB save failed: %s", e, exc_info=True)
         return

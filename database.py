@@ -188,6 +188,19 @@ async def save_message_semantic(msg_id: int, summary: str, embedding: bytes | No
         await db.commit()
 
 
+async def get_recent_forwarded_texts(hours: int = 24) -> list[str]:
+    """Полные тексты пересланных постов за окно (для текстового предфильтра дедупа)."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    async with aiosqlite.connect(config.DB_PATH) as db:
+        async with db.execute(
+            """SELECT text FROM messages
+               WHERE forwarded = 1 AND created_at > ?
+               ORDER BY created_at DESC""",
+            (cutoff,),
+        ) as cur:
+            return [r[0] for r in await cur.fetchall()]
+
+
 async def get_recent_forwarded_embeddings(hours: int = 24) -> list[bytes]:
     """BLOB'ы векторов пересланных постов за окно (для cosine-дедупа)."""
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
