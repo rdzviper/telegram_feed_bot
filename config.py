@@ -27,10 +27,11 @@ EMBEDDING_API_KEY = os.environ.get("EMBEDDING_API_KEY", "")
 EMBEDDING_BASE_URL = os.environ.get("EMBEDDING_BASE_URL", "https://api.openai.com/v1")
 EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "text-embedding-3-small")
 EMBEDDING_DIM = int(os.environ.get("EMBEDDING_DIM", "512"))
-# калибровка 2026-07-16 (tests/dedup_cases.md): max(между разными новостями)≈0.63,
-# классы перекрываются. Строгий старт 0.80 (безопасный отрыв от 0.63, ~33% охвата),
-# снижать к 0.72–0.75 (~44–56%) после подтверждения на живом потоке. Рычаг охвата — summary.
-DUPLICATE_COSINE_THRESHOLD = float(os.environ.get("DUPLICATE_COSINE_THRESHOLD", "0.80"))
+# калибровка 2026-07-16 с канонич. summary v2 (tests/dedup_cases.md): max(между
+# разными новостями)≈0.645; τ=0.75 → ~78% посл. охвата при 0 ложных склеек
+# (τ=0.72 → 100% на сете, но меньше отрыв). Строгий старт 0.75; крутить 0.72–0.80
+# через .env без пересборки (снижать = больше охват, повышать = безопаснее).
+DUPLICATE_COSINE_THRESHOLD = float(os.environ.get("DUPLICATE_COSINE_THRESHOLD", "0.75"))
 
 UNKNOWN_CONCEPT_EPS = float(os.environ.get("UNKNOWN_CONCEPT_EPS", "0.01"))
 
