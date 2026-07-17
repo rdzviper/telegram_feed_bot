@@ -16,6 +16,10 @@ DB_PATH = os.path.join(DATA_DIR, "db.sqlite")
 DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash")
 DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 
+# Сообщения альбома (grouped media) прилетают отдельными ивентами за миллисекунды.
+# Копим их debounce-окном и форвардим одним блоком.
+ALBUM_DEBOUNCE_SEC = float(os.environ.get("ALBUM_DEBOUNCE_SEC", "2.0"))
+
 RATE_LIMIT_PER_HOUR = int(os.environ.get("RATE_LIMIT_PER_HOUR", "20"))
 DRIFT_EVERY_N = int(os.environ.get("DRIFT_EVERY_N", "20"))
 

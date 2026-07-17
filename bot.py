@@ -38,12 +38,14 @@ async def main():
     bot = Bot(token=config.BOT_TOKEN, request=_request)
 
     queue: asyncio.Queue = asyncio.Queue()
+    # буфер альбомов: grouped_id -> {"event": праймари, "ids": [msg_id...], "timer": handle}
+    albums: dict[int, dict] = {}
 
     async def pipeline_worker():
         while True:
-            event = await queue.get()
+            event, media_ids = await queue.get()
             try:
-                await process_message(event, tg_client, bot)
+                await process_message(event, media_ids, tg_client, bot)
             except Exception as e:
                 logger.error("Pipeline error: %s", e, exc_info=True)
             finally:
@@ -51,22 +53,48 @@ async def main():
 
     asyncio.ensure_future(pipeline_worker())
 
+    def flush_album(gid: int):
+        # дебаунс истёк — альбом собран, отправляем в пайплайн одним постом
+        slot = albums.pop(gid, None)
+        if slot:
+            queue.put_nowait((slot["event"], sorted(slot["ids"])))
+
     @tg_client.on(events.NewMessage())
     async def on_new_message(event):
         if config.DEBUG_ALL_MESSAGES:
             logger.info(
-                "[DEBUG] chat_id=%s post=%s is_channel=%s megagroup=%s text=%.60r",
+                "[DEBUG] chat_id=%s post=%s is_channel=%s megagroup=%s grouped=%s text=%.60r",
                 event.chat_id,
                 event.message.post,
                 event.is_channel,
                 getattr(event.chat, "megagroup", None),
+                event.message.grouped_id,
                 event.message.text or "",
             )
         if not event.message.post:
             return
         if event.chat_id == config.NOTIFY_CHAT_ID:
             return
-        await queue.put(event)
+
+        gid = event.message.grouped_id
+        if gid is None:
+            await queue.put((event, [event.message.id]))
+            return
+
+        # альбом: копим сообщения группы, форвардим одним блоком после дебаунса
+        slot = albums.get(gid)
+        if slot is None:
+            slot = albums[gid] = {"event": event, "ids": [], "timer": None}
+        slot["ids"].append(event.message.id)
+        # праймари = сообщение с подписью (для анализа/скоринга); если ни у кого
+        # подписи нет — останется первое (медиа-only ветка в пайплайне)
+        if (event.message.text or "").strip():
+            slot["event"] = event
+        if slot["timer"] is not None:
+            slot["timer"].cancel()
+        slot["timer"] = asyncio.get_event_loop().call_later(
+            config.ALBUM_DEBOUNCE_SEC, flush_album, gid
+        )
 
     application = Application.builder().token(config.BOT_TOKEN).build()
     register_handlers(application)

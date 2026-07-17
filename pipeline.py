@@ -58,13 +58,14 @@ def _rate_limit_ok() -> bool:
     return len(_forwarded_times) < config.RATE_LIMIT_PER_HOUR
 
 
-async def process_message(event, tg_client: TelegramClient, bot: Bot):
+async def process_message(event, media_ids: list[int], tg_client: TelegramClient, bot: Bot):
+    """event — праймари-сообщение поста (с подписью, если есть); media_ids — все
+    id для форварда (>1 для альбома). Анализ идёт по подписи праймари-сообщения."""
     global _drift_counter
 
     text = event.message.text or ""
-    has_media = bool(event.message.media)
-    # Пост совсем без текста И без медиа — мусор, режем. Но медиа без подписи
-    # (видео/фото, пустой caption) — это контент: пересылаем его ниже, минуя анализ.
+    has_media = bool(event.message.media) or len(media_ids) > 1
+    # Пост совсем без текста И без медиа — мусор, режем.
     if not text.strip() and not has_media:
         logger.debug("Empty message (no text, no media), skipping")
         return
@@ -74,7 +75,8 @@ async def process_message(event, tg_client: TelegramClient, bot: Bot):
         event.chat.title if event.chat and hasattr(event.chat, "title") else str(channel_id)
     )
 
-    logger.info("Incoming: channel=%s media=%s text=%.80r", channel_name, has_media, text)
+    logger.info("Incoming: channel=%s media=%s items=%d text=%.80r",
+                channel_name, has_media, len(media_ids), text)
 
     await db.upsert_channel(channel_id, channel_name)
     await db.increment_seen(channel_id)
@@ -84,7 +86,8 @@ async def process_message(event, tg_client: TelegramClient, bot: Bot):
         return
 
     # Медиа без подписи: анализировать нечего (нет текста → нет концептов, summary,
-    # дедупа, скоринга). Форвардим как контент, минуя DeepSeek и порог.
+    # дедупа, скоринга). Форвардим как контент, минуя DeepSeek и порог; при этом
+    # companion-сообщение (голосовалку) НЕ шлём — оценивать нечего.
     media_only = not text.strip()
     if media_only:
         logger.debug("Media-only post (no caption): channel=%s, skipping analysis", channel_name)
@@ -189,45 +192,41 @@ async def process_message(event, tg_client: TelegramClient, bot: Bot):
         logger.warning("Rate limit reached, skipping %s", channel_name)
         return
 
-    logger.info("Forwarding: channel=%s local_score=%.1f threshold=%.1f drift=%s",
-                channel_name, local_score, threshold, is_drift)
+    logger.info("Forwarding: channel=%s local_score=%.1f threshold=%.1f drift=%s media_only=%s items=%d",
+                channel_name, local_score, threshold, is_drift, media_only, len(media_ids))
 
-    # под постом — только кнопка «Оценить», без текста. Telegram требует
-    # непустой текст, поэтому zero-width space (кнопка раскрывает меню топиков)
-    # медиа без подписи: концептов нет → кнопку «Оценить» не показываем, просто метка
-    if media_only:
-        vote_text = "🖼 <i>медиа без подписи</i>"
-        keyboard = None
-    else:
+    bot_message_id = None
+    try:
+        # forward_messages со списком id отдаёт альбом одним блоком
+        await tg_client.forward_messages(
+            config.NOTIFY_CHAT_ID,
+            media_ids,
+            event.chat_id,
+        )
+        logger.info("Forwarded OK: channel=%s (%d msg)", channel_name, len(media_ids))
+    except Exception as e:
+        logger.error("Forward failed: %s", e)
+        return
+
+    # companion-голосовалку шлём только если есть что оценивать (есть подпись).
+    # Для медиа без подписи ничего не шлём — сообщение не нужно.
+    if not media_only:
         prefix = "🔍 " if is_drift else ""
         vote_text = f"{prefix}Σ <b>{local_score:.2f}</b>/{threshold:.2f}"
         keyboard = InlineKeyboardMarkup(
             [[InlineKeyboardButton("🗳 Оценить", callback_data=f"rate:{msg_id}")]]
         )
-
-    bot_message_id = None
-    try:
-        await tg_client.forward_messages(
-            config.NOTIFY_CHAT_ID,
-            event.message.id,
-            event.chat_id,
-        )
-        logger.info("Forwarded OK: channel=%s", channel_name)
-    except Exception as e:
-        logger.error("Forward failed: %s", e)
-        return
-
-    try:
-        sent = await bot.send_message(
-            chat_id=config.NOTIFY_CHAT_ID,
-            text=vote_text,
-            parse_mode="HTML",
-            reply_markup=keyboard,
-        )
-        bot_message_id = sent.message_id
-        logger.info("Голосовалка sent: msg_id=%s", bot_message_id)
-    except Exception as e:
-        logger.error("Send keyboard failed: %s", e)
+        try:
+            sent = await bot.send_message(
+                chat_id=config.NOTIFY_CHAT_ID,
+                text=vote_text,
+                parse_mode="HTML",
+                reply_markup=keyboard,
+            )
+            bot_message_id = sent.message_id
+            logger.info("Голосовалка sent: msg_id=%s", bot_message_id)
+        except Exception as e:
+            logger.error("Send keyboard failed: %s", e)
 
     # держим notify-чат непрочитанным (свой форвард гасит бейдж) —
     # флаг серверный, синхронизируется на все клиенты
