@@ -62,8 +62,11 @@ async def process_message(event, tg_client: TelegramClient, bot: Bot):
     global _drift_counter
 
     text = event.message.text or ""
-    if not text.strip():
-        logger.debug("Empty message, skipping")
+    has_media = bool(event.message.media)
+    # Пост совсем без текста И без медиа — мусор, режем. Но медиа без подписи
+    # (видео/фото, пустой caption) — это контент: пересылаем его ниже, минуя анализ.
+    if not text.strip() and not has_media:
+        logger.debug("Empty message (no text, no media), skipping")
         return
 
     channel_id = event.chat_id
@@ -71,7 +74,7 @@ async def process_message(event, tg_client: TelegramClient, bot: Bot):
         event.chat.title if event.chat and hasattr(event.chat, "title") else str(channel_id)
     )
 
-    logger.info("Incoming: channel=%s text=%.80r", channel_name, text)
+    logger.info("Incoming: channel=%s media=%s text=%.80r", channel_name, has_media, text)
 
     await db.upsert_channel(channel_id, channel_name)
     await db.increment_seen(channel_id)
@@ -80,12 +83,18 @@ async def process_message(event, tg_client: TelegramClient, bot: Bot):
         logger.debug("channel=%s is disabled, skipping", channel_name)
         return
 
-    logger.debug("Sending to DeepSeek: channel=%s", channel_name)
-    result = await analyzer.analyze(text)
+    # Медиа без подписи: анализировать нечего (нет текста → нет концептов, summary,
+    # дедупа, скоринга). Форвардим как контент, минуя DeepSeek и порог.
+    media_only = not text.strip()
+    if media_only:
+        logger.debug("Media-only post (no caption): channel=%s, skipping analysis", channel_name)
+        result = {"concepts": [], "is_ad": False, "informative": True, "summary": ""}
+    else:
+        logger.debug("Sending to DeepSeek: channel=%s", channel_name)
+        result = await analyzer.analyze(text)
     concepts = result["concepts"]
     is_ad = result["is_ad"]
     informative = result["informative"]
-    has_media = bool(event.message.media)
 
     # локальный scoring по матрице весов
     weights = await db.get_concept_weights(concepts)
@@ -101,25 +110,28 @@ async def process_message(event, tg_client: TelegramClient, bot: Bot):
     local_score = sum(weights.get(c, default_w) for c in concepts)
 
     # --- Дедуп: слой 0 (текст, verbatim) + слой 1 (cosine саммари, смысл) ---
+    # Для медиа без подписи дедуп невозможен (нет ни текста, ни summary) — пропускаем.
     summary = result.get("summary", "")
     same_story = False
+    embedding = None
 
-    recent_texts = await db.get_recent_forwarded_texts(hours=config.DUPLICATE_HOURS)
-    if _is_text_duplicate(text, recent_texts):
-        same_story = True
-        logger.info("Duplicate (text pre-filter): channel=%s", channel_name)
-
-    embedding = await embeddings.embed(summary)
-    if not same_story and embedding is not None:
-        best = 0.0
-        for blob in await db.get_recent_forwarded_embeddings(hours=config.DUPLICATE_HOURS):
-            cos = float(embedding @ embeddings.from_blob(blob))
-            if cos > best:
-                best = cos
-        if best >= config.DUPLICATE_COSINE_THRESHOLD:
+    if not media_only:
+        recent_texts = await db.get_recent_forwarded_texts(hours=config.DUPLICATE_HOURS)
+        if _is_text_duplicate(text, recent_texts):
             same_story = True
-            logger.info("Duplicate (cosine=%.3f ≥ %.2f): channel=%s summary=%.80r",
-                        best, config.DUPLICATE_COSINE_THRESHOLD, channel_name, summary)
+            logger.info("Duplicate (text pre-filter): channel=%s", channel_name)
+
+        embedding = await embeddings.embed(summary)
+        if not same_story and embedding is not None:
+            best = 0.0
+            for blob in await db.get_recent_forwarded_embeddings(hours=config.DUPLICATE_HOURS):
+                cos = float(embedding @ embeddings.from_blob(blob))
+                if cos > best:
+                    best = cos
+            if best >= config.DUPLICATE_COSINE_THRESHOLD:
+                same_story = True
+                logger.info("Duplicate (cosine=%.3f ≥ %.2f): channel=%s summary=%.80r",
+                            best, config.DUPLICATE_COSINE_THRESHOLD, channel_name, summary)
 
     logger.info(
         "Analyzed: channel=%s concepts=%s local_score=%.1f threshold=%.1f is_ad=%s same_story=%s informative=%s media=%s",
@@ -156,7 +168,8 @@ async def process_message(event, tg_client: TelegramClient, bot: Bot):
         logger.info("channel=%s filtered: non-informative text", channel_name)
         return
 
-    should_forward = local_score >= threshold
+    # медиа без подписи скорить нечем — форвардим безусловно (медиа = контент)
+    should_forward = media_only or local_score >= threshold
     is_drift = False
 
     if not should_forward:
@@ -181,12 +194,16 @@ async def process_message(event, tg_client: TelegramClient, bot: Bot):
 
     # под постом — только кнопка «Оценить», без текста. Telegram требует
     # непустой текст, поэтому zero-width space (кнопка раскрывает меню топиков)
-    prefix = "🔍 " if is_drift else ""
-    vote_text = f"{prefix}Σ <b>{local_score:.2f}</b>/{threshold:.2f}"
-
-    keyboard = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("🗳 Оценить", callback_data=f"rate:{msg_id}")]]
-    )
+    # медиа без подписи: концептов нет → кнопку «Оценить» не показываем, просто метка
+    if media_only:
+        vote_text = "🖼 <i>медиа без подписи</i>"
+        keyboard = None
+    else:
+        prefix = "🔍 " if is_drift else ""
+        vote_text = f"{prefix}Σ <b>{local_score:.2f}</b>/{threshold:.2f}"
+        keyboard = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("🗳 Оценить", callback_data=f"rate:{msg_id}")]]
+        )
 
     bot_message_id = None
     try:
