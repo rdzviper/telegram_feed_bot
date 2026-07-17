@@ -6,7 +6,11 @@ from datetime import datetime, timezone
 
 from telethon import TelegramClient
 from telethon.tl.functions.messages import MarkDialogUnreadRequest
-from telethon.tl.types import InputDialogPeer
+from telethon.tl.types import (
+    InputDialogPeer,
+    MessageMediaGiveaway,
+    MessageMediaGiveawayResults,
+)
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 
 import config
@@ -83,6 +87,13 @@ async def process_message(event, media_ids: list[int], tg_client: TelegramClient
 
     if not await db.is_channel_active(channel_id):
         logger.debug("channel=%s is disabled, skipping", channel_name)
+        return
+
+    # Нативный Telegram Giveaway (премиум-фича) — спец. тип медиа, а не текст:
+    # «приз/участники/дата» лежат в объекте media, DeepSeek их не видит. Это всегда
+    # накрутка подписчиков → режем детерминированно, до анализа.
+    if isinstance(event.message.media, (MessageMediaGiveaway, MessageMediaGiveawayResults)):
+        logger.info("channel=%s filtered: telegram giveaway", channel_name)
         return
 
     # Медиа без подписи: анализировать нечего (нет текста → нет концептов, summary,
