@@ -12,6 +12,7 @@ import database as db
 import pipeline
 from pipeline import process_message
 from handlers import register_handlers, set_bot_commands
+from plugins import load_plugins
 
 logging.basicConfig(
     format="%(asctime)s %(name)-20s %(levelname)s %(message)s",
@@ -41,6 +42,11 @@ async def main():
     queue: asyncio.Queue = asyncio.Queue()
     # буфер альбомов: grouped_id -> {"event": праймари, "ids": [msg_id...], "timer": handle}
     albums: dict[int, dict] = {}
+
+    # Плагины сырого роутинга. channel_id -> [plugin...] заполняется после
+    # старта userbot-клиента (setup резолвит usernames в id).
+    plugins = load_plugins()
+    plugin_channel_map: dict[int, list] = {}
 
     async def pipeline_worker():
         while True:
@@ -77,6 +83,16 @@ async def main():
         if event.chat_id == config.NOTIFY_CHAT_ID:
             return
 
+        # каналы плагинов обходят основной пайплайн (сырой роутинг в свою БД)
+        ph = plugin_channel_map.get(event.chat_id)
+        if ph:
+            for p in ph:
+                try:
+                    await p.handle(event)
+                except Exception as e:
+                    logger.error("Plugin %s error: %s", p.name, e, exc_info=True)
+            return
+
         gid = event.message.grouped_id
         if gid is None:
             await queue.put((event, [event.message.id]))
@@ -108,6 +124,15 @@ async def main():
 
     await tg_client.start()
     logger.info("Userbot connected")
+
+    # Резолвим каналы плагинов и строим карту диспатча (до входящего трафика).
+    for p in plugins:
+        await p.setup(tg_client)
+        for cid in p.channel_ids:
+            plugin_channel_map.setdefault(cid, []).append(p)
+    if plugins:
+        logger.info("Plugins active: %s",
+                    {p.name: sorted(p.channel_ids) for p in plugins})
 
     logger.info("Syncing dialogs...")
     dialogs = await tg_client.get_dialogs()
