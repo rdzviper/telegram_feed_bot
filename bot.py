@@ -78,12 +78,9 @@ async def main():
                 event.message.grouped_id,
                 event.message.text or "",
             )
-        if not event.message.post:
-            return
-        if event.chat_id == config.NOTIFY_CHAT_ID:
-            return
-
-        # каналы плагинов обходят основной пайплайн (сырой роутинг в свою БД)
+        # Плагины сырого роутинга — ДО фильтра по типу: источник может быть
+        # чатом/мегагруппой (post=False), а не broadcast-каналом. Матч по
+        # chat_id, обход основного пайплайна.
         ph = plugin_channel_map.get(event.chat_id)
         if ph:
             for p in ph:
@@ -91,6 +88,11 @@ async def main():
                     await p.handle(event)
                 except Exception as e:
                     logger.error("Plugin %s error: %s", p.name, e, exc_info=True)
+            return
+
+        if not event.message.post:
+            return
+        if event.chat_id == config.NOTIFY_CHAT_ID:
             return
 
         gid = event.message.grouped_id
