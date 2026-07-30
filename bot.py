@@ -123,6 +123,10 @@ async def main():
 
     await bot.send_message(config.NOTIFY_CHAT_ID, "✅ Бот запущен, лайк +1, дизлайк -0.3")
 
+    # On start: if a post is already queued — show it; otherwise put up the
+    # empty plaque. Later arrivals auto-release while the feed is idle.
+    await pipeline.deliver_next()
+
     try:
         await tg_client.run_until_disconnected()
     finally:

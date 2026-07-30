@@ -2,15 +2,14 @@ import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import ContextTypes, CommandHandler, CallbackQueryHandler
 import database as db
-import analyzer
 import config
 import pipeline
 import keyboards
 
 logger = logging.getLogger(__name__)
 
-# Telegram: 4096 симв/сообщение и 100 кнопок/клавиатуру. Держим запас,
-# иначе при большом числе каналов команды падают с BadRequest.
+# Telegram: 4096 chars/message and 100 buttons/keyboard. Keep headroom,
+# otherwise large channel lists fail with BadRequest.
 _MSG_CHAR_LIMIT = 3800
 _KB_ROW_LIMIT = 90
 _STATS_HEADER = "📊 <b>Статистика каналов</b> (А→Я)\n\n"
@@ -40,20 +39,14 @@ def _channel_button(ch: dict) -> InlineKeyboardButton:
     return InlineKeyboardButton(label, callback_data=f"toggle:{ch['channel_id']}")
 
 
-# --- голосование по топикам поста ---
-# Концепты теперь всегда развёрнуты (компаньон отправляется сразу с рядами
-# голосов, см. pipeline.deliver_batch); клавиатуру для перерисовки после
-# голоса строит общий keyboards.companion_keyboard.
-
-
 def _render_stats_pages(channels: list[dict]) -> list[str]:
-    """Текстовые страницы статистики (без кнопок), разбитые под лимит 4096 симв."""
+    """Text-only stats pages split under the 4096-char limit."""
     pages: list[str] = []
     lines: list[str] = []
     length = len(_STATS_HEADER)
     for ch in channels:
         line = _channel_line(ch)
-        extra = len(line) + 2  # разделитель "\n\n"
+        extra = len(line) + 2  # "\n\n" separator
         if lines and length + extra > _MSG_CHAR_LIMIT:
             pages.append(_STATS_HEADER + "\n\n".join(lines))
             lines, length = [], len(_STATS_HEADER)
@@ -65,7 +58,7 @@ def _render_stats_pages(channels: list[dict]) -> list[str]:
 
 
 def _render_channel_pages(channels: list[dict]) -> list[tuple[str, InlineKeyboardMarkup]]:
-    """Страницы управления: заголовок + кнопки-тумблеры, разбитые под лимит 100 кнопок."""
+    """Channel toggle pages split under the 100-button limit."""
     pages: list[tuple[str, InlineKeyboardMarkup]] = []
     buttons: list[list[InlineKeyboardButton]] = []
     for ch in channels:
@@ -106,65 +99,73 @@ async def channels_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+async def _is_current_anchor(msg_id: int) -> bool:
+    anchor = await db.get_setting("anchor_msg_id")
+    return anchor == str(msg_id)
+
+
+async def _finalize_and_advance(query, msg_id: int, choice: str):
+    """Replace buttons with a final mark, then show next post (or empty plaque)."""
+    try:
+        await query.edit_message_reply_markup(
+            reply_markup=keyboards.result_keyboard(choice)
+        )
+    except Exception as e:
+        logger.warning("Finalize keyboard failed msg_id=%s: %s", msg_id, e)
+
+    if await _is_current_anchor(msg_id):
+        await pipeline.deliver_next()
+
+
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not _authorized(update):
         await query.answer("Нет доступа", show_alert=True)
         return
-    data = query.data
+    data = query.data or ""
 
-    if data.startswith("page:"):
-        # «Промотать»/«Следующий» — всегда отдаёт следующие до PAGE_SIZE постов
-        # из очереди, ничего не пропуская. Единственная кнопка внизу ленты —
-        # если жмут не на актуальном якоре (уже прибит новым постом), молчим.
-        msg_id_str = data.split(":", 1)[1]
-        anchor_msg_id = await db.get_setting("anchor_msg_id")
-        if anchor_msg_id != msg_id_str:
+    if data.startswith(("like:", "dislike:")):
+        kind, msg_id_str = data.split(":", 1)
+        msg_id = int(msg_id_str)
+        choice = "like" if kind == "like" else "dislike"
+
+        if not await _is_current_anchor(msg_id):
             await query.answer("Устарело")
             return
-        await query.answer()
-        await pipeline.deliver_batch()
 
-    elif data.startswith(("tl:", "td:")):
-        # голос по одному топику: вес правим точечно и только на первый голос
-        kind, msg_id_str, idx_str = data.split(":")
-        msg_id, idx = int(msg_id_str), int(idx_str)
-        choice = "like" if kind == "tl" else "dislike"
+        if await db.get_user_choice(msg_id):
+            await query.answer("Уже оценено")
+            return
 
         concepts = await db.get_message_concepts(msg_id)
-        if idx >= len(concepts):
-            await query.answer("Устарело", show_alert=True)
+        delta = 1.0 if choice == "like" else -0.3
+        if concepts:
+            await db.update_interests(concepts, delta=delta)
+        await db.set_user_choice(msg_id, choice)
+        await db.increment_channel_vote(msg_id, choice)
+        await pipeline.refresh_threshold()
+        logger.info("post %s concepts=%d delta=%s", choice, len(concepts), delta)
+        await query.answer("👍 +1.0" if choice == "like" else "👎 −0.3")
+        await _finalize_and_advance(query, msg_id, choice)
+
+    elif data.startswith("skip:"):
+        msg_id = int(data.split(":", 1)[1])
+        if not await _is_current_anchor(msg_id):
+            await query.answer("Устарело")
             return
-        topic = concepts[idx]
-
-        # идемпотентность на уровне БД: вес применяем только если голос новый
-        if await db.add_topic_vote(msg_id, idx, choice):
-            delta = 1.0 if choice == "like" else -0.3
-            await db.update_interests([topic], delta=delta)
-            await db.increment_channel_vote(msg_id, choice)
-            await pipeline.refresh_threshold()
-            logger.info("topic %s %r delta=%s", choice, topic, delta)
-            await query.answer("👍 +1.0" if choice == "like" else "👎 −0.3")
-        else:
+        if await db.get_user_choice(msg_id):
             await query.answer("Уже оценено")
-
-        votes = await db.get_topic_votes(msg_id)
-        anchor_msg_id = await db.get_setting("anchor_msg_id")
-        with_pager = anchor_msg_id == str(msg_id)
-        try:
-            await query.edit_message_reply_markup(
-                reply_markup=keyboards.companion_keyboard(msg_id, concepts, votes, with_pager)
-            )
-        except Exception as e:
-            logger.error("topic vote edit failed: %s", e)
+            return
+        await db.set_user_choice(msg_id, "skip")
+        await query.answer("⏭")
+        await _finalize_and_advance(query, msg_id, "skip")
 
     elif data.startswith("toggle:"):
         channel_id = int(data.split(":", 1)[1])
         new_state = await db.toggle_channel(channel_id)
         status = "включён ✅" if new_state else "отключён ❌"
         await query.answer(status, show_alert=True)
-        # /channels может быть разбит на несколько сообщений — не ре-рендерим всё.
-        # Обновляем только кнопку в ЭТОМ сообщении.
+        # /channels may span several messages — re-render only this one.
         old_rows = query.message.reply_markup.inline_keyboard if query.message.reply_markup else []
         new_rows = []
         for row in old_rows:
@@ -190,7 +191,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def error_handler(update, context):
     err = context.error
-    # таймауты и сетевые ошибки — обычное дело, не нужен трейсбэк
     from telegram.error import TimedOut, NetworkError
     if isinstance(err, (TimedOut, NetworkError)):
         logger.warning("Telegram network error: %s", err)
@@ -205,7 +205,7 @@ BOT_COMMANDS = [
 
 
 async def set_bot_commands(application):
-    """Регистрирует меню команд бота (кнопка «/» в клиенте Telegram)."""
+    """Register bot command menu (the «/» button in Telegram clients)."""
     await application.bot.set_my_commands(BOT_COMMANDS)
 
 
