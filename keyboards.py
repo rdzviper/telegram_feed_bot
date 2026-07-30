@@ -12,6 +12,13 @@ def action_keyboard(msg_id: int) -> InlineKeyboardMarkup:
     ]])
 
 
+def skip_only_keyboard(msg_id: int) -> InlineKeyboardMarkup:
+    """Media-only posts (no caption) — just advance to the next post, no voting."""
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("⏭", callback_data=f"skip:{msg_id}"),
+    ]])
+
+
 def result_keyboard(choice: str) -> InlineKeyboardMarkup:
     """Final mark after like/dislike/skip — no more actions."""
     mark = {"like": "✅", "dislike": "❌", "skip": "⏭"}.get(choice, "•")

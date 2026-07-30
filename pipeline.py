@@ -300,8 +300,8 @@ async def _deliver_one(row: dict) -> dict | None:
         if media_only:
             sent = await _bot.send_message(
                 chat_id=config.NOTIFY_CHAT_ID,
-                text="📎",
-                reply_markup=keyboards.action_keyboard(msg_id),
+                text="•",
+                reply_markup=keyboards.skip_only_keyboard(msg_id),
             )
         else:
             prefix = "🔍 " if is_drift else ""
