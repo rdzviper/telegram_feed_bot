@@ -69,6 +69,8 @@ async def main():
     for cluster, pid, text in posts:
         res = await analyzer.analyze(text)
         summary = res.get("summary", "")
+        print(f"  {pid}: concepts={res.get('concepts')} is_ad={res.get('is_ad')} "
+              f"informative={res.get('informative')}\n{'':<7}summary={summary!r}")
         v = await embeddings.embed(summary)
         if v is None:
             print(f"  ! {pid}: вектор не получен, пропуск")

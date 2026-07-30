@@ -36,6 +36,7 @@ async def main():
         pool_timeout=30,
     )
     bot = Bot(token=config.BOT_TOKEN, request=_request)
+    pipeline.set_clients(tg_client, bot)
 
     queue: asyncio.Queue = asyncio.Queue()
     # буфер альбомов: grouped_id -> {"event": праймари, "ids": [msg_id...], "timer": handle}
@@ -45,7 +46,7 @@ async def main():
         while True:
             event, media_ids = await queue.get()
             try:
-                await process_message(event, media_ids, tg_client, bot)
+                await process_message(event, media_ids)
             except Exception as e:
                 logger.error("Pipeline error: %s", e, exc_info=True)
             finally:

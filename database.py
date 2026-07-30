@@ -57,6 +57,13 @@ _MIGRATIONS = [
     "ALTER TABLE messages ADD COLUMN local_score REAL",
     "ALTER TABLE messages ADD COLUMN summary TEXT",
     "ALTER TABLE messages ADD COLUMN embedding BLOB",
+    # Очередь доставки (pull-модель, см. tests/dedup_cases.md-соседние доки):
+    # 'queued' — проанализирован и принят, ждёт показа; 'delivered' — показан
+    # (компаньон отправлен); старые строки (до миграции) остаются 'delivered'
+    # по дефолту — они уже были доставлены в старой модели.
+    "ALTER TABLE messages ADD COLUMN delivery_state TEXT DEFAULT 'delivered'",
+    "ALTER TABLE messages ADD COLUMN media_ids TEXT",
+    "ALTER TABLE messages ADD COLUMN threshold_at_score REAL",
 ]
 
 
@@ -174,6 +181,81 @@ async def mark_forwarded(msg_id: int, bot_message_id: int | None, is_drift: bool
         await db.execute(
             "UPDATE messages SET forwarded = 1, bot_message_id = ?, is_drift = ? WHERE id = ?",
             (bot_message_id, int(is_drift), msg_id),
+        )
+        await db.commit()
+
+
+# --- Очередь доставки (pull-модель) ---
+
+async def enqueue_message(msg_id: int, media_ids: list[int], threshold: float, is_drift: bool):
+    """Пост принят к показу: forwarded=1 сразу (чтобы участвовал в дедупе
+    следующих входящих, даже пока сам ждёт своей очереди на показ)."""
+    async with aiosqlite.connect(config.DB_PATH) as db:
+        await db.execute(
+            """UPDATE messages
+               SET forwarded = 1, is_drift = ?, media_ids = ?, threshold_at_score = ?,
+                   delivery_state = 'queued'
+               WHERE id = ?""",
+            (int(is_drift), json.dumps(media_ids), threshold, msg_id),
+        )
+        await db.commit()
+
+
+async def count_queued() -> int:
+    async with aiosqlite.connect(config.DB_PATH) as db:
+        async with db.execute(
+            "SELECT COUNT(*) FROM messages WHERE delivery_state = 'queued'"
+        ) as cur:
+            row = await cur.fetchone()
+            return row[0] or 0
+
+
+async def get_queued_batch(limit: int) -> list[dict]:
+    cols = ["id", "channel_id", "channel_name", "orig_message_id", "media_ids",
+            "text", "concepts", "local_score", "threshold_at_score", "is_drift"]
+    async with aiosqlite.connect(config.DB_PATH) as db:
+        async with db.execute(
+            f"""SELECT {", ".join(cols)} FROM messages
+                WHERE delivery_state = 'queued'
+                ORDER BY id ASC LIMIT ?""",
+            (limit,),
+        ) as cur:
+            rows = await cur.fetchall()
+            return [dict(zip(cols, r)) for r in rows]
+
+
+async def mark_delivered(msg_id: int, bot_message_id: int | None):
+    async with aiosqlite.connect(config.DB_PATH) as db:
+        await db.execute(
+            "UPDATE messages SET delivery_state = 'delivered', bot_message_id = ? WHERE id = ?",
+            (bot_message_id, msg_id),
+        )
+        await db.commit()
+
+
+async def mark_delivery_failed(msg_id: int):
+    """Форвард не удался (пост в источнике удалили и т.п.) — закрываем слот,
+    чтобы не зависать в очереди на битом сообщении."""
+    async with aiosqlite.connect(config.DB_PATH) as db:
+        await db.execute(
+            "UPDATE messages SET delivery_state = 'delivered' WHERE id = ?", (msg_id,)
+        )
+        await db.commit()
+
+
+async def get_setting(key: str) -> str | None:
+    async with aiosqlite.connect(config.DB_PATH) as db:
+        async with db.execute("SELECT value FROM settings WHERE key = ?", (key,)) as cur:
+            row = await cur.fetchone()
+            return row[0] if row else None
+
+
+async def set_setting(key: str, value: str):
+    async with aiosqlite.connect(config.DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO settings (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
         )
         await db.commit()
 

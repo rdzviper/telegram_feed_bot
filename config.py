@@ -23,6 +23,10 @@ ALBUM_DEBOUNCE_SEC = float(os.environ.get("ALBUM_DEBOUNCE_SEC", "2.0"))
 RATE_LIMIT_PER_HOUR = int(os.environ.get("RATE_LIMIT_PER_HOUR", "20"))
 DRIFT_EVERY_N = int(os.environ.get("DRIFT_EVERY_N", "20"))
 
+# --- Очередь доставки (pull-модель): показываем по кнопке, не все сразу ---
+PAGE_SIZE = int(os.environ.get("PAGE_SIZE", "10"))
+QUEUE_CAP = int(os.environ.get("QUEUE_CAP", "200"))
+
 DUPLICATE_OVERLAP_THRESHOLD = float(os.environ.get("DUPLICATE_OVERLAP_THRESHOLD", "0.6"))
 DUPLICATE_HOURS = int(os.environ.get("DUPLICATE_HOURS", "24"))
 

@@ -1,4 +1,6 @@
+import asyncio
 import html
+import json
 import logging
 import re
 from collections import deque
@@ -11,14 +13,27 @@ from telethon.tl.types import (
     MessageMediaGiveaway,
     MessageMediaGiveawayResults,
 )
-from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Bot
 
 import config
 import database as db
 import analyzer
 import embeddings
+import keyboards
 
 logger = logging.getLogger(__name__)
+
+# --- клиенты, общие для process_message (вызывается из очереди bot.py)
+# и deliver_batch (вызывается также из handlers.py по кнопке «Промотать») ---
+_tg_client: TelegramClient | None = None
+_bot: Bot | None = None
+_delivery_lock = asyncio.Lock()
+_at_cap = False
+
+
+def set_clients(tg_client: TelegramClient, bot: Bot):
+    global _tg_client, _bot
+    _tg_client, _bot = tg_client, bot
 
 _URL_RE = re.compile(r"https?://\S+|t\.me/\S+")
 _NONWORD_RE = re.compile(r"[^\w\s]", re.UNICODE)
@@ -62,10 +77,10 @@ def _rate_limit_ok() -> bool:
     return len(_forwarded_times) < config.RATE_LIMIT_PER_HOUR
 
 
-async def process_message(event, media_ids: list[int], tg_client: TelegramClient, bot: Bot):
+async def process_message(event, media_ids: list[int]):
     """event — праймари-сообщение поста (с подписью, если есть); media_ids — все
     id для форварда (>1 для альбома). Анализ идёт по подписи праймари-сообщения."""
-    global _drift_counter
+    global _drift_counter, _at_cap
 
     text = event.message.text or ""
     has_media = bool(event.message.media) or len(media_ids) > 1
@@ -88,6 +103,20 @@ async def process_message(event, media_ids: list[int], tg_client: TelegramClient
     if not await db.is_channel_active(channel_id):
         logger.debug("channel=%s is disabled, skipping", channel_name)
         return
+
+    # Предохранитель: очередь показа не резиновая. Если пользователь давно не
+    # жал «Промотать», не копим до бесконечности — дропаем новые посты.
+    # Разгружается само по мере пролистывания. Лог edge-triggered, не спамим.
+    queued_now = await db.count_queued()
+    if queued_now >= config.QUEUE_CAP:
+        if not _at_cap:
+            _at_cap = True
+            logger.warning("Queue cap reached (%d/%d), dropping new messages until it drains",
+                            queued_now, config.QUEUE_CAP)
+        return
+    elif _at_cap:
+        _at_cap = False
+        logger.info("Queue below cap again (%d/%d), resuming", queued_now, config.QUEUE_CAP)
 
     # Нативный Telegram Giveaway (премиум-фича) — спец. тип медиа, а не текст:
     # «приз/участники/дата» лежат в объекте media, DeepSeek их не видит. Это всегда
@@ -203,50 +232,160 @@ async def process_message(event, media_ids: list[int], tg_client: TelegramClient
         logger.warning("Rate limit reached, skipping %s", channel_name)
         return
 
-    logger.info("Forwarding: channel=%s local_score=%.1f threshold=%.1f drift=%s media_only=%s items=%d",
+    logger.info("Queued: channel=%s local_score=%.1f threshold=%.1f drift=%s media_only=%s items=%d",
                 channel_name, local_score, threshold, is_drift, media_only, len(media_ids))
 
-    bot_message_id = None
-    try:
-        # forward_messages со списком id отдаёт альбом одним блоком
-        await tg_client.forward_messages(
-            config.NOTIFY_CHAT_ID,
-            media_ids,
-            event.chat_id,
-        )
-        logger.info("Forwarded OK: channel=%s (%d msg)", channel_name, len(media_ids))
-    except Exception as e:
-        logger.error("Forward failed: %s", e)
-        return
+    _forwarded_times.append(datetime.now(timezone.utc).timestamp())
+    await db.enqueue_message(msg_id, media_ids, threshold, is_drift)
+    await _maybe_auto_release()
 
-    # companion-голосовалку шлём только если есть что оценивать (есть подпись).
-    # Для медиа без подписи ничего не шлём — сообщение не нужно.
-    if not media_only:
-        prefix = "🔍 " if is_drift else ""
-        vote_text = f"{prefix}Σ <b>{local_score:.2f}</b>/{threshold:.2f}"
-        keyboard = InlineKeyboardMarkup(
-            [[InlineKeyboardButton("🗳 Оценить", callback_data=f"rate:{msg_id}")]]
+
+async def _maybe_auto_release():
+    """Новый пост встал в очередь. Если лента сейчас простаивает (якорь —
+    заглушка «Больше постов нет» или его вообще ещё не было), это единственный
+    момент, когда доставка идёт без нажатия кнопки — иначе бы кнопку неоткуда
+    было взять. Если якорь уже висит на посте (юзер ещё не долистал предыдущую
+    пачку), просто копим — новый показ ждёт нажатия «Промотать»."""
+    anchor_kind = await db.get_setting("anchor_kind")
+    if anchor_kind in (None, "", "placeholder"):
+        await deliver_batch()
+
+
+def _row_media_ids(row: dict) -> list[int]:
+    raw = row.get("media_ids")
+    return json.loads(raw) if raw else [row["orig_message_id"]]
+
+
+async def _strip_pager(anchor_kind: str, anchor_msg_id: int, anchor_bot_msg_id: int):
+    """Снимает строку пейджера с текущего якоря, оставляя остальное содержимое
+    (голоса по концептам для текстового поста) как есть."""
+    try:
+        if anchor_kind == "text":
+            concepts = await db.get_message_concepts(anchor_msg_id)
+            votes = await db.get_topic_votes(anchor_msg_id)
+            markup = keyboards.companion_keyboard(anchor_msg_id, concepts, votes, with_pager=False)
+        elif anchor_kind == "media":
+            markup = None
+        else:
+            return
+        await _bot.edit_message_reply_markup(
+            chat_id=config.NOTIFY_CHAT_ID, message_id=anchor_bot_msg_id, reply_markup=markup
         )
-        try:
-            sent = await bot.send_message(
+    except Exception as e:
+        logger.warning("Strip pager failed: %s", e)
+
+
+async def _deliver_one(row: dict, with_pager: bool) -> dict | None:
+    """Форвардит один пост из очереди + шлёт компаньон (кроме медиа-без-подписи
+    не в хвосте пачки — там компаньон не нужен). Возвращает {"kind",
+    "bot_message_id", "msg_id"} — вызывающий использует результат последнего
+    элемента пачки, чтобы установить новый якорь; None, если ставить нечего
+    (форвард не удался, либо компаньон не отправлялся)."""
+    msg_id = row["id"]
+    text = row["text"] or ""
+    media_only = not text.strip()
+    concepts = json.loads(row["concepts"]) if row["concepts"] else []
+    is_drift = bool(row["is_drift"])
+    local_score = row["local_score"] or 0.0
+    threshold = row["threshold_at_score"] or 0.0
+
+    try:
+        await _tg_client.forward_messages(config.NOTIFY_CHAT_ID, _row_media_ids(row), row["channel_id"])
+        logger.info("Forwarded OK: channel=%s msg_id=%s", row["channel_name"], msg_id)
+    except Exception as e:
+        logger.error("Forward failed for queued msg_id=%s: %s", msg_id, e)
+        await db.mark_delivery_failed(msg_id)
+        return None
+
+    bot_message_id = None
+    kind = "media" if media_only else "text"
+
+    # медиа без подписи вне хвоста пачки не оценить и незачем пейджить —
+    # компаньон вообще не нужен (как и раньше, тихий форвард); только последний
+    # элемент пачки получает компаньон-с-кнопкой, чтобы было на чём висеть якорю
+    if media_only and not with_pager:
+        await db.mark_delivered(msg_id, None)
+        await db.increment_forwarded(row["channel_id"])
+        return None
+
+    try:
+        if media_only:
+            sent = await _bot.send_message(
+                chat_id=config.NOTIFY_CHAT_ID,
+                text="📎",
+                reply_markup=keyboards.media_keyboard(msg_id, with_pager),
+            )
+        else:
+            votes = await db.get_topic_votes(msg_id)
+            prefix = "🔍 " if is_drift else ""
+            vote_text = f"{prefix}Σ <b>{local_score:.2f}</b>/{threshold:.2f}"
+            sent = await _bot.send_message(
                 chat_id=config.NOTIFY_CHAT_ID,
                 text=vote_text,
                 parse_mode="HTML",
-                reply_markup=keyboard,
+                reply_markup=keyboards.companion_keyboard(msg_id, concepts, votes, with_pager),
             )
-            bot_message_id = sent.message_id
-            logger.info("Голосовалка sent: msg_id=%s", bot_message_id)
-        except Exception as e:
-            logger.error("Send keyboard failed: %s", e)
-
-    # держим notify-чат непрочитанным (свой форвард гасит бейдж) —
-    # флаг серверный, синхронизируется на все клиенты
-    try:
-        peer = await tg_client.get_input_entity(config.NOTIFY_CHAT_ID)
-        await tg_client(MarkDialogUnreadRequest(peer=InputDialogPeer(peer=peer), unread=True))
+        bot_message_id = sent.message_id
     except Exception as e:
-        logger.warning("Mark unread failed: %s", e)
+        logger.error("Send companion failed for msg_id=%s: %s", msg_id, e)
 
-    _forwarded_times.append(datetime.now(timezone.utc).timestamp())
-    await db.mark_forwarded(msg_id, bot_message_id, is_drift)
-    await db.increment_forwarded(channel_id)
+    await db.mark_delivered(msg_id, bot_message_id)
+    await db.increment_forwarded(row["channel_id"])
+    return {"kind": kind, "bot_message_id": bot_message_id, "msg_id": msg_id}
+
+
+async def deliver_batch():
+    """Отдаёт следующие до PAGE_SIZE постов из очереди. Вызывается либо из
+    _maybe_auto_release (лента простаивала), либо из handlers.py по нажатию
+    кнопки пейджера. Сериализовано локом — обе точки входа асинхронны и могут
+    пересечься по времени."""
+    async with _delivery_lock:
+        batch = await db.get_queued_batch(config.PAGE_SIZE)
+        anchor_kind = await db.get_setting("anchor_kind") or ""
+        anchor_bot_msg_id_raw = await db.get_setting("anchor_bot_msg_id")
+        anchor_msg_id_raw = await db.get_setting("anchor_msg_id")
+
+        if not batch:
+            if anchor_kind in ("text", "media") and anchor_bot_msg_id_raw and anchor_msg_id_raw:
+                await _strip_pager(anchor_kind, int(anchor_msg_id_raw), int(anchor_bot_msg_id_raw))
+            if anchor_kind != "placeholder":
+                sent = await _bot.send_message(config.NOTIFY_CHAT_ID, "📭 Больше постов нет")
+                await db.set_setting("anchor_kind", "placeholder")
+                await db.set_setting("anchor_bot_msg_id", str(sent.message_id))
+                await db.set_setting("anchor_msg_id", "")
+            return
+
+        if anchor_kind == "placeholder" and anchor_bot_msg_id_raw:
+            try:
+                await _bot.delete_message(config.NOTIFY_CHAT_ID, int(anchor_bot_msg_id_raw))
+            except Exception as e:
+                logger.warning("Delete placeholder failed: %s", e)
+        elif anchor_kind in ("text", "media") and anchor_bot_msg_id_raw and anchor_msg_id_raw:
+            await _strip_pager(anchor_kind, int(anchor_msg_id_raw), int(anchor_bot_msg_id_raw))
+
+        last = None
+        for i, row in enumerate(batch):
+            result = await _deliver_one(row, with_pager=(i == len(batch) - 1))
+            if result:
+                last = result
+
+        if last and last["bot_message_id"] is not None:
+            await db.set_setting("anchor_kind", last["kind"])
+            await db.set_setting("anchor_bot_msg_id", str(last["bot_message_id"]))
+            await db.set_setting("anchor_msg_id", str(last["msg_id"]))
+        elif last:
+            # компаньон последнего поста пачки не отправился (сбой Telegram API) —
+            # вешать пейджер не на что; откатываемся в «пусто», следующий новый
+            # пост подхватит через _maybe_auto_release, ручной кнопки до тех пор нет
+            logger.warning("Last batch item msg_id=%s has no companion, clearing anchor", last["msg_id"])
+            await db.set_setting("anchor_kind", "")
+            await db.set_setting("anchor_bot_msg_id", "")
+            await db.set_setting("anchor_msg_id", "")
+
+        # держим notify-чат непрочитанным (свой форвард гасит бейдж) —
+        # флаг серверный, синхронизируется на все клиенты
+        try:
+            peer = await _tg_client.get_input_entity(config.NOTIFY_CHAT_ID)
+            await _tg_client(MarkDialogUnreadRequest(peer=InputDialogPeer(peer=peer), unread=True))
+        except Exception as e:
+            logger.warning("Mark unread failed: %s", e)

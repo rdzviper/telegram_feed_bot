@@ -5,6 +5,7 @@ import database as db
 import analyzer
 import config
 import pipeline
+import keyboards
 
 logger = logging.getLogger(__name__)
 
@@ -39,43 +40,10 @@ def _channel_button(ch: dict) -> InlineKeyboardButton:
     return InlineKeyboardButton(label, callback_data=f"toggle:{ch['channel_id']}")
 
 
-# --- меню оценки поста по топикам ---
-# Состояние живёт в БД (concepts по msg_id) и в самой клавиатуре сообщения —
-# в процессе ничего не копится, память не течёт.
-_TOPIC_LABEL_MAX = 24
-
-
-def _trunc(topic: str) -> str:
-    return topic if len(topic) <= _TOPIC_LABEL_MAX else topic[: _TOPIC_LABEL_MAX - 1] + "…"
-
-
-def _rate_keyboard(msg_id: int) -> InlineKeyboardMarkup:
-    """Свёрнутое состояние: одна кнопка «Оценить»."""
-    return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("🗳 Оценить", callback_data=f"rate:{msg_id}")]]
-    )
-
-
-def _voted_row(topic: str, choice: str) -> list[InlineKeyboardButton]:
-    """Оценённый топик: одна кнопка [✅/❌ топик], кнопки лайков убраны."""
-    mark = "✅" if choice == "like" else "❌"
-    return [InlineKeyboardButton(f"{mark} {_trunc(topic)}", callback_data="noop")]
-
-
-def _topics_keyboard(msg_id: int, concepts: list[str], votes: dict[int, str]) -> InlineKeyboardMarkup:
-    """Развёрнутое состояние: тумблер «Спрятать» + строка на топик.
-    Оценённые топики (из votes) показываются галкой/крестом без кнопок."""
-    rows = [[InlineKeyboardButton("🙈 Спрятать", callback_data=f"hide:{msg_id}")]]
-    for i, topic in enumerate(concepts):
-        if i in votes:
-            rows.append(_voted_row(topic, votes[i]))
-        else:
-            rows.append([
-                InlineKeyboardButton(_trunc(topic), callback_data="noop"),
-                InlineKeyboardButton("👍", callback_data=f"tl:{msg_id}:{i}"),
-                InlineKeyboardButton("👎", callback_data=f"td:{msg_id}:{i}"),
-            ])
-    return InlineKeyboardMarkup(rows)
+# --- голосование по топикам поста ---
+# Концепты теперь всегда развёрнуты (компаньон отправляется сразу с рядами
+# голосов, см. pipeline.deliver_batch); клавиатуру для перерисовки после
+# голоса строит общий keyboards.companion_keyboard.
 
 
 def _render_stats_pages(channels: list[dict]) -> list[str]:
@@ -145,30 +113,17 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     data = query.data
 
-    if data.startswith("rate:"):
-        # «Оценить» → раскрываем список топиков (тумблер станет «Спрятать»)
-        msg_id = int(data.split(":", 1)[1])
-        concepts = await db.get_message_concepts(msg_id)
-        if not concepts:
-            await query.answer("Нет топиков для оценки", show_alert=True)
+    if data.startswith("page:"):
+        # «Промотать»/«Следующий» — всегда отдаёт следующие до PAGE_SIZE постов
+        # из очереди, ничего не пропуская. Единственная кнопка внизу ленты —
+        # если жмут не на актуальном якоре (уже прибит новым постом), молчим.
+        msg_id_str = data.split(":", 1)[1]
+        anchor_msg_id = await db.get_setting("anchor_msg_id")
+        if anchor_msg_id != msg_id_str:
+            await query.answer("Устарело")
             return
-        votes = await db.get_topic_votes(msg_id)
         await query.answer()
-        try:
-            await query.edit_message_reply_markup(
-                reply_markup=_topics_keyboard(msg_id, concepts, votes)
-            )
-        except Exception as e:
-            logger.error("rate expand failed: %s", e)
-
-    elif data.startswith("hide:"):
-        # «Спрятать» → сворачиваем обратно в одну кнопку «Оценить»
-        msg_id = int(data.split(":", 1)[1])
-        await query.answer()
-        try:
-            await query.edit_message_reply_markup(reply_markup=_rate_keyboard(msg_id))
-        except Exception as e:
-            logger.error("hide collapse failed: %s", e)
+        await pipeline.deliver_batch()
 
     elif data.startswith(("tl:", "td:")):
         # голос по одному топику: вес правим точечно и только на первый голос
@@ -194,9 +149,11 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("Уже оценено")
 
         votes = await db.get_topic_votes(msg_id)
+        anchor_msg_id = await db.get_setting("anchor_msg_id")
+        with_pager = anchor_msg_id == str(msg_id)
         try:
             await query.edit_message_reply_markup(
-                reply_markup=_topics_keyboard(msg_id, concepts, votes)
+                reply_markup=keyboards.companion_keyboard(msg_id, concepts, votes, with_pager)
             )
         except Exception as e:
             logger.error("topic vote edit failed: %s", e)
