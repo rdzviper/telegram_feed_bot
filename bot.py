@@ -60,6 +60,22 @@ async def main():
 
     asyncio.ensure_future(pipeline_worker())
 
+    async def cleanup_worker():
+        while True:
+            try:
+                deleted, cleared = await db.cleanup_old_data(
+                    config.MESSAGE_RETENTION_DAYS, config.EMBEDDING_RETENTION_HOURS
+                )
+                logger.info(
+                    "Retention cleanup: deleted %d old messages, cleared %d embeddings",
+                    deleted, cleared,
+                )
+            except Exception as e:
+                logger.error("Cleanup error: %s", e, exc_info=True)
+            await asyncio.sleep(config.CLEANUP_INTERVAL_HOURS * 3600)
+
+    asyncio.ensure_future(cleanup_worker())
+
     def flush_album(gid: int):
         # дебаунс истёк — альбом собран, отправляем в пайплайн одним постом
         slot = albums.pop(gid, None)
