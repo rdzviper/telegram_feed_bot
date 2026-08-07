@@ -8,7 +8,7 @@ TG_API_HASH = os.environ["TG_API_HASH"]
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 NOTIFY_CHAT_ID = int(os.environ["NOTIFY_CHAT_ID"])  # HOP1 relay channel ("Telegram feed"), userbot forwards here
 DM_CHAT_ID = int(os.environ["DM_CHAT_ID"])  # HOP2 target: private chat Alex<->bot, actual reading/voting
-DEEPSEEK_API_KEY = os.environ["DEEPSEEK_API_KEY"]
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 
 DATA_DIR = os.environ.get("DATA_DIR", "/app/data")
 SESSION_PATH = os.path.join(DATA_DIR, "session")
@@ -16,6 +16,21 @@ DB_PATH = os.path.join(DATA_DIR, "db.sqlite")
 
 DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash")
 DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+
+# --- Выбор провайдера LLM для analyzer.py: "deepseek" (старый, api.deepseek.com)
+# или "timeweb" (Timeweb Cloud AI Agent, OpenAI-совместимый прокси к deepseek-v4-flash).
+# Переключение только через .env, без правки кода.
+AI_PROVIDER = os.environ.get("AI_PROVIDER", "deepseek")
+TIMEWEB_AGENT_TOKEN = os.environ.get("TIMEWEB_AGENT_TOKEN", "")
+TIMEWEB_AGENT_ACCESS_ID = os.environ.get("TIMEWEB_AGENT_ACCESS_ID", "")
+TIMEWEB_BASE_URL = (
+    f"https://agent.timeweb.cloud/api/v1/cloud-ai/agents/{TIMEWEB_AGENT_ACCESS_ID}/v1"
+    if TIMEWEB_AGENT_ACCESS_ID
+    else ""
+)
+# Модель для Timeweb-агента поле model в запросе игнорируется сервером (агент сам
+# знает свою модель), но OpenAI SDK требует непустое значение — держим для логов.
+TIMEWEB_MODEL = os.environ.get("TIMEWEB_MODEL", "deepseek/deepseek-v4-flash")
 
 # Сообщения альбома (grouped media) прилетают отдельными ивентами за миллисекунды.
 # Копим их debounce-окном и форвардим одним блоком.
@@ -39,6 +54,12 @@ EMBEDDING_DIM = int(os.environ.get("EMBEDDING_DIM", "512"))
 DUPLICATE_COSINE_THRESHOLD = float(os.environ.get("DUPLICATE_COSINE_THRESHOLD", "0.75"))
 
 UNKNOWN_CONCEPT_EPS = float(os.environ.get("UNKNOWN_CONCEPT_EPS", "0.01"))
+
+# --- Retention: embedding нужен только внутри окна дедупа (DUPLICATE_HOURS),
+# сам текст/мета дальше хранятся лишь для истории/просмотра — неделя достаточно.
+MESSAGE_RETENTION_DAYS = int(os.environ.get("MESSAGE_RETENTION_DAYS", "7"))
+EMBEDDING_RETENTION_HOURS = int(os.environ.get("EMBEDDING_RETENTION_HOURS", "24"))
+CLEANUP_INTERVAL_HOURS = int(os.environ.get("CLEANUP_INTERVAL_HOURS", "24"))
 
 ALLOWED_USER_ID = int(os.environ["ALLOWED_USER_ID"])
 

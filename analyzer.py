@@ -5,10 +5,21 @@ import config
 
 logger = logging.getLogger(__name__)
 
-_client = AsyncOpenAI(
-    api_key=config.DEEPSEEK_API_KEY,
-    base_url=config.DEEPSEEK_BASE_URL,
-)
+# Выбор провайдера через config.AI_PROVIDER ("deepseek" | "timeweb"), см. config.py.
+if config.AI_PROVIDER == "timeweb":
+    _client = AsyncOpenAI(
+        api_key=config.TIMEWEB_AGENT_TOKEN,
+        base_url=config.TIMEWEB_BASE_URL,
+    )
+    _MODEL = config.TIMEWEB_MODEL
+else:
+    _client = AsyncOpenAI(
+        api_key=config.DEEPSEEK_API_KEY,
+        base_url=config.DEEPSEEK_BASE_URL,
+    )
+    _MODEL = config.DEEPSEEK_MODEL
+
+logger.info("analyzer: AI_PROVIDER=%s model=%s", config.AI_PROVIDER, _MODEL)
 
 _ANALYZE_PROMPT = """\
 Проанализируй Telegram-пост и верни JSON.
@@ -48,11 +59,13 @@ _ANALYZE_PROMPT = """\
 """
 
 _CALL_KWARGS = dict(
-    model=config.DEEPSEEK_MODEL,
+    model=_MODEL,
     temperature=0,
     response_format={"type": "json_object"},
-    extra_body={"thinking": {"type": "disabled"}},
 )
+if config.AI_PROVIDER != "timeweb":
+    # DeepSeek-специфичный параметр, Timeweb-обёртка его не знает.
+    _CALL_KWARGS["extra_body"] = {"thinking": {"type": "disabled"}}
 
 _WORDS_PER_CONCEPT = 20
 _MAX_CONCEPTS = 10
@@ -96,7 +109,7 @@ async def analyze(text: str) -> dict:
     n = target_concept_count(text)
     prompt = _ANALYZE_PROMPT.format(text=text[:1500], n=n)
     try:
-        logger.debug("Calling DeepSeek model=%s n=%d prompt_len=%d", config.DEEPSEEK_MODEL, n, len(prompt))
+        logger.debug("Calling %s model=%s n=%d prompt_len=%d", config.AI_PROVIDER, _MODEL, n, len(prompt))
         response = await _client.chat.completions.create(
             messages=[{"role": "user", "content": prompt}],
             max_tokens=250,

@@ -271,6 +271,31 @@ async def get_recent_forwarded_embeddings(hours: int = 24) -> list[bytes]:
             return [r[0] for r in await cur.fetchall()]
 
 
+async def cleanup_old_data(message_retention_days: int, embedding_retention_hours: int) -> tuple[int, int]:
+    """Ретеншн: старые messages целиком удаляем (текст/мета дальше не нужны),
+    embedding чистим раньше и агрессивнее — за пределами окна дедупа он мёртвый груз
+    (2КБ/строка, самая тяжёлая колонка в базе). Возвращает (удалено сообщений, очищено embedding)."""
+    msg_cutoff = (datetime.now(timezone.utc) - timedelta(days=message_retention_days)).isoformat()
+    emb_cutoff = (datetime.now(timezone.utc) - timedelta(hours=embedding_retention_hours)).isoformat()
+    async with aiosqlite.connect(config.DB_PATH) as db:
+        cur = await db.execute("DELETE FROM messages WHERE created_at < ?", (msg_cutoff,))
+        deleted = cur.rowcount
+        # topic_votes/message_deliveries без FK/CASCADE — чистим осиротевшие вручную
+        await db.execute(
+            "DELETE FROM topic_votes WHERE msg_id NOT IN (SELECT id FROM messages)"
+        )
+        await db.execute(
+            "DELETE FROM message_deliveries WHERE msg_id NOT IN (SELECT id FROM messages)"
+        )
+        cur2 = await db.execute(
+            "UPDATE messages SET embedding = NULL WHERE embedding IS NOT NULL AND created_at < ?",
+            (emb_cutoff,),
+        )
+        cleared = cur2.rowcount
+        await db.commit()
+    return deleted, cleared
+
+
 async def get_recent_forwarded_concepts(hours: int = 24) -> list[list[str]]:
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
     async with aiosqlite.connect(config.DB_PATH) as db:
