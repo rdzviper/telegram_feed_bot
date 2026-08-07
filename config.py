@@ -6,7 +6,8 @@ load_dotenv()
 TG_API_ID = int(os.environ["TG_API_ID"])
 TG_API_HASH = os.environ["TG_API_HASH"]
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-NOTIFY_CHAT_ID = int(os.environ["NOTIFY_CHAT_ID"])
+NOTIFY_CHAT_ID = int(os.environ["NOTIFY_CHAT_ID"])  # HOP1 relay channel ("Telegram feed"), userbot forwards here
+DM_CHAT_ID = int(os.environ["DM_CHAT_ID"])  # HOP2 target: private chat Alex<->bot, actual reading/voting
 DEEPSEEK_API_KEY = os.environ["DEEPSEEK_API_KEY"]
 
 DATA_DIR = os.environ.get("DATA_DIR", "/app/data")
@@ -22,11 +23,6 @@ ALBUM_DEBOUNCE_SEC = float(os.environ.get("ALBUM_DEBOUNCE_SEC", "2.0"))
 
 RATE_LIMIT_PER_HOUR = int(os.environ.get("RATE_LIMIT_PER_HOUR", "20"))
 DRIFT_EVERY_N = int(os.environ.get("DRIFT_EVERY_N", "20"))
-
-# --- Delivery queue (pull model): one post at a time, advance on like/skip/dislike ---
-# PAGE_SIZE kept for .env compatibility; delivery always takes 1.
-PAGE_SIZE = int(os.environ.get("PAGE_SIZE", "1"))
-QUEUE_CAP = int(os.environ.get("QUEUE_CAP", "200"))
 
 DUPLICATE_OVERLAP_THRESHOLD = float(os.environ.get("DUPLICATE_OVERLAP_THRESHOLD", "0.6"))
 DUPLICATE_HOURS = int(os.environ.get("DUPLICATE_HOURS", "24"))

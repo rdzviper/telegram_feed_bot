@@ -121,7 +121,11 @@ async def main():
     await application.initialize()
     await set_bot_commands(application)
     await application.start()
-    await application.updater.start_polling()
+    # message_reaction is NOT in the default update set — must ask explicitly,
+    # otherwise vote reactions in DM_CHAT_ID never arrive (confirmed via probe).
+    await application.updater.start_polling(
+        allowed_updates=["message", "callback_query", "message_reaction"]
+    )
     logger.info("Bot polling started")
 
     await tg_client.start()
@@ -148,11 +152,7 @@ async def main():
     else:
         logger.info("No stale channels to prune")
 
-    await bot.send_message(config.NOTIFY_CHAT_ID, "✅ Бот запущен, лайк +1, дизлайк -0.3")
-
-    # On start: if a post is already queued — show it; otherwise put up the
-    # empty plaque. Later arrivals auto-release while the feed is idle.
-    await pipeline.deliver_next()
+    await bot.send_message(config.DM_CHAT_ID, "✅ Бот запущен")
 
     try:
         await tg_client.run_until_disconnected()

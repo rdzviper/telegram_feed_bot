@@ -1,12 +1,24 @@
 import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
-from telegram.ext import ContextTypes, CommandHandler, CallbackQueryHandler
+from telegram.ext import (
+    ContextTypes,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageReactionHandler,
+)
 import database as db
 import config
 import pipeline
-import keyboards
 
 logger = logging.getLogger(__name__)
+
+# Subset of telegram.constants.ReactionEmoji (the full default Bot API catalog,
+# verified 2026-08-05 against python-telegram-bot 21.6 — 💩 IS in the default
+# set, not custom_emoji-only as assumed during design). Reactions outside these
+# two buckets (incl. genuine custom_emoji, Premium accounts) are ignored.
+_LIKE_EMOJI = {"👍", "❤", "🔥", "🥰", "👏", "😁", "🎉", "🤩", "🙏", "👌",
+               "😍", "❤‍🔥", "💯", "🤣", "🏆", "🆒", "💘", "😘", "😎"}
+_DISLIKE_EMOJI = {"👎", "🤬", "😢", "🤮", "💩", "💔", "🖕", "😭", "😡", "🤡"}
 
 # Telegram: 4096 chars/message and 100 buttons/keyboard. Keep headroom,
 # otherwise large channel lists fail with BadRequest.
@@ -99,22 +111,54 @@ async def channels_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
-async def _is_current_anchor(msg_id: int) -> bool:
-    anchor = await db.get_setting("anchor_msg_id")
-    return anchor == str(msg_id)
+async def reaction_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Native reaction on a DM copy = vote. No companion, no anchor: first
+    reaction from a known bucket sticks (db.get_user_choice guard); later
+    changes to the reaction are not un-applied (weights model is not
+    reversible). See SPEC.md 'Отказ от отдельного notify-чата' revision."""
+    mr = update.message_reaction
+    if mr is None or mr.chat.type != "private" or mr.chat.id != config.DM_CHAT_ID:
+        return
+    if mr.user is None or mr.user.id != config.ALLOWED_USER_ID:
+        return
+    if not mr.new_reaction:
+        return  # reaction removed, not added — no vote to apply
 
+    emoji = None
+    for r in mr.new_reaction:
+        if r.type == "emoji":
+            emoji = r.emoji
+            break
+    if emoji is None:
+        return  # custom_emoji reaction (Premium) — not handled yet
 
-async def _finalize_and_advance(query, msg_id: int, choice: str):
-    """Replace buttons with a final mark, then show next post (or empty plaque)."""
-    try:
-        await query.edit_message_reply_markup(
-            reply_markup=keyboards.result_keyboard(choice)
+    if emoji in _LIKE_EMOJI:
+        choice = "like"
+    elif emoji in _DISLIKE_EMOJI:
+        choice = "dislike"
+    else:
+        return  # not a known vote emoji — ignore
+
+    msg_id = await db.resolve_msg_id(mr.message_id)
+    if msg_id is None:
+        return
+    if await db.get_user_choice(msg_id):
+        return  # already voted
+
+    concepts = await db.get_message_concepts(msg_id)
+    delta = 1.0 if choice == "like" else -0.3
+    if concepts:
+        await db.update_interests(concepts, delta=delta)
+    await db.set_user_choice(msg_id, choice)
+    await db.increment_channel_vote(msg_id, choice)
+    await pipeline.refresh_threshold()
+    logger.info("post %s concepts=%d delta=%s", choice, len(concepts), delta)
+
+    if concepts:
+        mark = "👍" if choice == "like" else "👎"
+        await context.bot.send_message(
+            chat_id=config.DM_CHAT_ID, text=f"{mark} {choice}: {', '.join(concepts)}"
         )
-    except Exception as e:
-        logger.warning("Finalize keyboard failed msg_id=%s: %s", msg_id, e)
-
-    if await _is_current_anchor(msg_id):
-        await pipeline.deliver_next()
 
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -124,43 +168,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     data = query.data or ""
 
-    if data.startswith(("like:", "dislike:")):
-        kind, msg_id_str = data.split(":", 1)
-        msg_id = int(msg_id_str)
-        choice = "like" if kind == "like" else "dislike"
-
-        if not await _is_current_anchor(msg_id):
-            await query.answer("Устарело")
-            return
-
-        if await db.get_user_choice(msg_id):
-            await query.answer("Уже оценено")
-            return
-
-        concepts = await db.get_message_concepts(msg_id)
-        delta = 1.0 if choice == "like" else -0.3
-        if concepts:
-            await db.update_interests(concepts, delta=delta)
-        await db.set_user_choice(msg_id, choice)
-        await db.increment_channel_vote(msg_id, choice)
-        await pipeline.refresh_threshold()
-        logger.info("post %s concepts=%d delta=%s", choice, len(concepts), delta)
-        await query.answer("👍 +1.0" if choice == "like" else "👎 −0.3")
-        await _finalize_and_advance(query, msg_id, choice)
-
-    elif data.startswith("skip:"):
-        msg_id = int(data.split(":", 1)[1])
-        if not await _is_current_anchor(msg_id):
-            await query.answer("Устарело")
-            return
-        if await db.get_user_choice(msg_id):
-            await query.answer("Уже оценено")
-            return
-        await db.set_user_choice(msg_id, "skip")
-        await query.answer("⏭")
-        await _finalize_and_advance(query, msg_id, "skip")
-
-    elif data.startswith("toggle:"):
+    if data.startswith("toggle:"):
         channel_id = int(data.split(":", 1)[1])
         new_state = await db.toggle_channel(channel_id)
         status = "включён ✅" if new_state else "отключён ❌"
@@ -213,4 +221,5 @@ def register_handlers(application):
     application.add_handler(CommandHandler("stats", stats_command))
     application.add_handler(CommandHandler("channels", channels_command))
     application.add_handler(CallbackQueryHandler(button_callback))
+    application.add_handler(MessageReactionHandler(reaction_callback))
     application.add_error_handler(error_handler)

@@ -50,6 +50,14 @@ CREATE TABLE IF NOT EXISTS topic_votes (
     choice TEXT NOT NULL,
     PRIMARY KEY (msg_id, topic_idx)
 );
+
+-- Infinite-feed delivery (2026-08-05): a post can occupy several DM messages
+-- (album = one Telegram message per media item). Maps each back to its post,
+-- uniformly for single messages (one row) and albums (one row per item).
+CREATE TABLE IF NOT EXISTS message_deliveries (
+    dm_message_id INTEGER PRIMARY KEY,
+    msg_id INTEGER NOT NULL
+);
 """
 
 _MIGRATIONS = [
@@ -176,71 +184,38 @@ async def get_message_concepts(msg_id: int) -> list[str]:
             return []
 
 
-async def mark_forwarded(msg_id: int, bot_message_id: int | None, is_drift: bool):
-    async with aiosqlite.connect(config.DB_PATH) as db:
-        await db.execute(
-            "UPDATE messages SET forwarded = 1, bot_message_id = ?, is_drift = ? WHERE id = ?",
-            (bot_message_id, int(is_drift), msg_id),
-        )
-        await db.commit()
-
-
-# --- Очередь доставки (pull-модель) ---
-
-async def enqueue_message(msg_id: int, media_ids: list[int], threshold: float, is_drift: bool):
-    """Пост принят к показу: forwarded=1 сразу (чтобы участвовал в дедупе
-    следующих входящих, даже пока сам ждёт своей очереди на показ)."""
+async def mark_forwarded(msg_id: int, media_ids: list[int], is_drift: bool, threshold: float):
+    """Пост принят к показу и уходит в доставку немедленно (бесконечная лента,
+    без очереди/anchor): forwarded=1 сразу, чтобы участвовал в дедупе следующих
+    входящих."""
     async with aiosqlite.connect(config.DB_PATH) as db:
         await db.execute(
             """UPDATE messages
-               SET forwarded = 1, is_drift = ?, media_ids = ?, threshold_at_score = ?,
-                   delivery_state = 'queued'
+               SET forwarded = 1, is_drift = ?, media_ids = ?, threshold_at_score = ?
                WHERE id = ?""",
             (int(is_drift), json.dumps(media_ids), threshold, msg_id),
         )
         await db.commit()
 
 
-async def count_queued() -> int:
+async def save_message_deliveries(dm_message_ids: list[int], msg_id: int):
+    """Мапит все DM-сообщения поста (1 для одиночного, N для альбома) на его
+    внутренний msg_id — резолв реакции на любое из них даёт один и тот же пост."""
+    async with aiosqlite.connect(config.DB_PATH) as db:
+        await db.executemany(
+            "INSERT OR REPLACE INTO message_deliveries (dm_message_id, msg_id) VALUES (?, ?)",
+            [(dm_id, msg_id) for dm_id in dm_message_ids],
+        )
+        await db.commit()
+
+
+async def resolve_msg_id(dm_message_id: int) -> int | None:
     async with aiosqlite.connect(config.DB_PATH) as db:
         async with db.execute(
-            "SELECT COUNT(*) FROM messages WHERE delivery_state = 'queued'"
+            "SELECT msg_id FROM message_deliveries WHERE dm_message_id = ?", (dm_message_id,)
         ) as cur:
             row = await cur.fetchone()
-            return row[0] or 0
-
-
-async def get_queued_batch(limit: int) -> list[dict]:
-    cols = ["id", "channel_id", "channel_name", "orig_message_id", "media_ids",
-            "text", "concepts", "local_score", "threshold_at_score", "is_drift"]
-    async with aiosqlite.connect(config.DB_PATH) as db:
-        async with db.execute(
-            f"""SELECT {", ".join(cols)} FROM messages
-                WHERE delivery_state = 'queued'
-                ORDER BY id ASC LIMIT ?""",
-            (limit,),
-        ) as cur:
-            rows = await cur.fetchall()
-            return [dict(zip(cols, r)) for r in rows]
-
-
-async def mark_delivered(msg_id: int, bot_message_id: int | None):
-    async with aiosqlite.connect(config.DB_PATH) as db:
-        await db.execute(
-            "UPDATE messages SET delivery_state = 'delivered', bot_message_id = ? WHERE id = ?",
-            (bot_message_id, msg_id),
-        )
-        await db.commit()
-
-
-async def mark_delivery_failed(msg_id: int):
-    """Форвард не удался (пост в источнике удалили и т.п.) — закрываем слот,
-    чтобы не зависать в очереди на битом сообщении."""
-    async with aiosqlite.connect(config.DB_PATH) as db:
-        await db.execute(
-            "UPDATE messages SET delivery_state = 'delivered' WHERE id = ?", (msg_id,)
-        )
-        await db.commit()
+            return row[0] if row else None
 
 
 async def get_setting(key: str) -> str | None:

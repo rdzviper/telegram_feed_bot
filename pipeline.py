@@ -1,14 +1,10 @@
-import asyncio
-import json
 import logging
 import re
 from collections import deque
 from datetime import datetime, timezone
 
 from telethon import TelegramClient
-from telethon.tl.functions.messages import MarkDialogUnreadRequest
 from telethon.tl.types import (
-    InputDialogPeer,
     MessageMediaGiveaway,
     MessageMediaGiveawayResults,
 )
@@ -18,16 +14,12 @@ import config
 import database as db
 import analyzer
 import embeddings
-import keyboards
 
 logger = logging.getLogger(__name__)
 
-# Shared clients for process_message (queue worker) and deliver_next
-# (vote/skip handlers + idle auto-release).
+# Shared clients for process_message (queue worker) and _deliver (HOP1/HOP2 forward).
 _tg_client: TelegramClient | None = None
 _bot: Bot | None = None
-_delivery_lock = asyncio.Lock()
-_at_cap = False
 
 
 def set_clients(tg_client: TelegramClient, bot: Bot):
@@ -78,7 +70,7 @@ def _rate_limit_ok() -> bool:
 async def process_message(event, media_ids: list[int]):
     """event — primary post message (with caption if any); media_ids — all ids
     to forward (>1 for albums). Analysis runs on the primary caption."""
-    global _drift_counter, _at_cap
+    global _drift_counter
 
     text = event.message.text or ""
     has_media = bool(event.message.media) or len(media_ids) > 1
@@ -102,20 +94,6 @@ async def process_message(event, media_ids: list[int]):
         logger.debug("channel=%s is disabled, skipping", channel_name)
         return
 
-    # Safety valve: the display queue is not infinite. If the user has not
-    # voted/skipped for a long time, drop new posts instead of growing forever.
-    # Self-drains as the user advances. Edge-triggered log, no spam.
-    queued_now = await db.count_queued()
-    if queued_now >= config.QUEUE_CAP:
-        if not _at_cap:
-            _at_cap = True
-            logger.warning("Queue cap reached (%d/%d), dropping new messages until it drains",
-                            queued_now, config.QUEUE_CAP)
-        return
-    elif _at_cap:
-        _at_cap = False
-        logger.info("Queue below cap again (%d/%d), resuming", queued_now, config.QUEUE_CAP)
-
     # Native Telegram Giveaway (premium) is a special media type, not text:
     # prize/participants/date live on the media object, DeepSeek never sees them.
     # Always subscriber-bait → drop deterministically before analysis.
@@ -124,7 +102,7 @@ async def process_message(event, media_ids: list[int]):
         return
 
     # Media without caption: nothing to analyze (no concepts/summary/dedup/score).
-    # Still enqueue as content, but companion has no concept rows to vote on.
+    # Still delivered as content; a reaction on it just has nothing to update.
     media_only = not text.strip()
     if media_only:
         logger.debug("Media-only post (no caption): channel=%s, skipping analysis", channel_name)
@@ -229,163 +207,46 @@ async def process_message(event, media_ids: list[int]):
         logger.warning("Rate limit reached, skipping %s", channel_name)
         return
 
-    logger.info("Queued: channel=%s local_score=%.1f threshold=%.1f drift=%s media_only=%s items=%d",
+    logger.info("Delivering: channel=%s local_score=%.1f threshold=%.1f drift=%s media_only=%s items=%d",
                 channel_name, local_score, threshold, is_drift, media_only, len(media_ids))
 
     _forwarded_times.append(datetime.now(timezone.utc).timestamp())
-    await db.enqueue_message(msg_id, media_ids, threshold, is_drift)
-    await _maybe_auto_release()
+    await db.mark_forwarded(msg_id, media_ids, is_drift, threshold)
+    await _deliver(msg_id, media_ids, channel_id, channel_name)
 
 
-async def _maybe_auto_release():
-    """A new post just entered the queue. Deliver it only while the feed is
-    idle: no current post on screen (empty/missing anchor, or empty plaque).
-    If a post is already shown and waiting for like/skip/dislike — just keep
-    accumulating; the next press advances."""
-    anchor_kind = await db.get_setting("anchor_kind")
-    if anchor_kind in (None, "", "placeholder"):
-        await deliver_next()
-
-
-def _row_media_ids(row: dict) -> list[int]:
-    raw = row.get("media_ids")
-    return json.loads(raw) if raw else [row["orig_message_id"]]
-
-
-async def _delete_placeholder(anchor_bot_msg_id_raw: str | None):
-    if not anchor_bot_msg_id_raw:
-        return
+async def _deliver(msg_id: int, media_ids: list[int], channel_id: int, channel_name: str):
+    """Infinite feed, no anchor/pacing: HOP1 userbot forward (source → relay
+    NOTIFY_CHAT_ID, the only account subscribed to sources) then HOP2 bot
+    forward (relay → DM_CHAT_ID, a real incoming message for Alex — no
+    self-authored scroll-to-bottom, no MarkDialogUnread focus-loss). Voting
+    happens as a native reaction directly on the DM copies; message_deliveries
+    maps every dm_message_id (1 for a single post, N for an album) back to
+    msg_id uniformly."""
     try:
-        await _bot.delete_message(config.NOTIFY_CHAT_ID, int(anchor_bot_msg_id_raw))
+        fwd = await _tg_client.forward_messages(config.NOTIFY_CHAT_ID, media_ids, channel_id)
     except Exception as e:
-        logger.warning("Delete placeholder failed: %s", e)
-
-
-async def _show_empty_plaque():
-    """Send (or keep) the «no more posts» plaque and pin it as the anchor."""
-    anchor_kind = await db.get_setting("anchor_kind") or ""
-    if anchor_kind == "placeholder":
+        logger.error("HOP1 forward failed for msg_id=%s: %s", msg_id, e)
         return
-    sent = await _bot.send_message(config.NOTIFY_CHAT_ID, "📭 Постов больше нет")
-    await db.set_setting("anchor_kind", "placeholder")
-    await db.set_setting("anchor_bot_msg_id", str(sent.message_id))
-    await db.set_setting("anchor_msg_id", "")
+    relay_ids = [m.id for m in fwd] if isinstance(fwd, list) else [fwd.id]
 
-
-async def _deliver_one(row: dict) -> dict | None:
-    """Forward one queued post + send companion with 👍/⏭/👎.
-    Returns {"kind", "bot_message_id", "msg_id"} for the new anchor, or None
-    if the forward failed."""
-    msg_id = row["id"]
-    text = row["text"] or ""
-    media_only = not text.strip()
-    is_drift = bool(row["is_drift"])
-    local_score = row["local_score"] or 0.0
-    threshold = row["threshold_at_score"] or 0.0
-
+    # Batch forward (Bot API forwardMessages, plural) in one call — same as
+    # Telethon's HOP1 batch — so an album stays grouped in the DM, instead of
+    # arriving as N separate messages (singular forward_message per item).
     try:
-        await _tg_client.forward_messages(
-            config.NOTIFY_CHAT_ID, _row_media_ids(row), row["channel_id"]
+        sent = await _bot.forward_messages(
+            chat_id=config.DM_CHAT_ID, from_chat_id=config.NOTIFY_CHAT_ID, message_ids=relay_ids
         )
-        logger.info("Forwarded OK: channel=%s msg_id=%s", row["channel_name"], msg_id)
+        dm_message_ids = [m.message_id for m in sent]
     except Exception as e:
-        logger.error("Forward failed for queued msg_id=%s: %s", msg_id, e)
-        await db.mark_delivery_failed(msg_id)
-        return None
+        logger.error("HOP2 forward failed for msg_id=%s: %s", msg_id, e)
+        dm_message_ids = []
 
-    kind = "media" if media_only else "text"
-    bot_message_id = None
+    if not dm_message_ids:
+        logger.error("HOP2 fully failed for msg_id=%s, no DM copies delivered", msg_id)
+        return
 
-    try:
-        if media_only:
-            sent = await _bot.send_message(
-                chat_id=config.NOTIFY_CHAT_ID,
-                text="•",
-                reply_markup=keyboards.skip_only_keyboard(msg_id),
-            )
-        else:
-            prefix = "🔍 " if is_drift else ""
-            vote_text = f"{prefix}Σ <b>{local_score:.2f}</b>/{threshold:.2f}"
-            sent = await _bot.send_message(
-                chat_id=config.NOTIFY_CHAT_ID,
-                text=vote_text,
-                parse_mode="HTML",
-                reply_markup=keyboards.action_keyboard(msg_id),
-            )
-        bot_message_id = sent.message_id
-    except Exception as e:
-        logger.error("Send companion failed for msg_id=%s: %s", msg_id, e)
-
-    await db.mark_delivered(msg_id, bot_message_id)
-    await db.increment_forwarded(row["channel_id"])
-
-    if bot_message_id is None:
-        # Companion failed — nothing to hang buttons on. Leave anchor empty so
-        # the next auto-release / next button still has a path forward.
-        return None
-    return {"kind": kind, "bot_message_id": bot_message_id, "msg_id": msg_id}
-
-
-async def deliver_next():
-    """Show the next single post from the queue, or the empty plaque.
-    Called from:
-      - bot startup (empty feed → plaque)
-      - _maybe_auto_release (idle feed + new queued post)
-      - handlers after like / skip / dislike
-    Serialized by lock — both entry points are async and can race."""
-    async with _delivery_lock:
-        batch = await db.get_queued_batch(1)
-        anchor_kind = await db.get_setting("anchor_kind") or ""
-        anchor_bot_msg_id_raw = await db.get_setting("anchor_bot_msg_id")
-
-        if not batch:
-            if anchor_kind in ("text", "media") and anchor_bot_msg_id_raw:
-                # Previous post already finalized its keyboard in the handler;
-                # just move the anchor to the empty plaque.
-                pass
-            await _show_empty_plaque()
-            return
-
-        if anchor_kind == "placeholder":
-            await _delete_placeholder(anchor_bot_msg_id_raw)
-        # Previous post keeps its final mark (✅/❌/⏭) from the handler —
-        # do not strip it when advancing.
-
-        result = await _deliver_one(batch[0])
-        if result:
-            await db.set_setting("anchor_kind", result["kind"])
-            await db.set_setting("anchor_bot_msg_id", str(result["bot_message_id"]))
-            await db.set_setting("anchor_msg_id", str(result["msg_id"]))
-        else:
-            # Forward/companion failed. If more posts remain, try the next one
-            # immediately; otherwise fall back to empty plaque.
-            more = await db.count_queued()
-            if more > 0:
-                logger.warning("Delivery failed, retrying next queued post (%d left)", more)
-                # Drop lock briefly is not possible here; recurse under same lock
-                # via a local loop instead of nested deliver_next().
-                while True:
-                    nxt = await db.get_queued_batch(1)
-                    if not nxt:
-                        await _show_empty_plaque()
-                        break
-                    result = await _deliver_one(nxt[0])
-                    if result:
-                        await db.set_setting("anchor_kind", result["kind"])
-                        await db.set_setting("anchor_bot_msg_id", str(result["bot_message_id"]))
-                        await db.set_setting("anchor_msg_id", str(result["msg_id"]))
-                        break
-            else:
-                await _show_empty_plaque()
-
-        # Disabled: MarkDialogUnread on Desktop Telegram kicks the user out of
-        # the open chat ("Select a chat to start messaging") after each vote/skip.
-        # try:
-        #     peer = await _tg_client.get_input_entity(config.NOTIFY_CHAT_ID)
-        #     await _tg_client(MarkDialogUnreadRequest(peer=InputDialogPeer(peer=peer), unread=True))
-        # except Exception as e:
-        #     logger.warning("Mark unread failed: %s", e)
-
-
-# Back-compat alias if anything still imports the old name.
-deliver_batch = deliver_next
+    await db.save_message_deliveries(dm_message_ids, msg_id)
+    await db.increment_forwarded(channel_id)
+    logger.info("Delivered: channel=%s msg_id=%s dm_messages=%d",
+                channel_name, msg_id, len(dm_message_ids))
