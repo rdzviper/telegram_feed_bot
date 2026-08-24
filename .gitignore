@@ -6,6 +6,9 @@ data/
 *.session
 *.session-journal
 
+# Сырые видео-примеры для калибровки phash-дедупа (тяжёлые бинарники)
+tests/video examples/
+
 # Python
 __pycache__/
 *.py[cod]

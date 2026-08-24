@@ -58,6 +58,14 @@ CREATE TABLE IF NOT EXISTS message_deliveries (
     dm_message_id INTEGER PRIMARY KEY,
     msg_id INTEGER NOT NULL
 );
+
+-- Perceptual hash превью медиа (2026-08-18) — по одной строке на media-item,
+-- альбом даёт несколько строк на один msg_id.
+CREATE TABLE IF NOT EXISTS message_media_hashes (
+    msg_id INTEGER NOT NULL,
+    phash TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_media_hashes_msg ON message_media_hashes(msg_id);
 """
 
 _MIGRATIONS = [
@@ -280,12 +288,16 @@ async def cleanup_old_data(message_retention_days: int, embedding_retention_hour
     async with aiosqlite.connect(config.DB_PATH) as db:
         cur = await db.execute("DELETE FROM messages WHERE created_at < ?", (msg_cutoff,))
         deleted = cur.rowcount
-        # topic_votes/message_deliveries без FK/CASCADE — чистим осиротевшие вручную
+        # topic_votes/message_deliveries/message_media_hashes без FK/CASCADE —
+        # чистим осиротевшие вручную
         await db.execute(
             "DELETE FROM topic_votes WHERE msg_id NOT IN (SELECT id FROM messages)"
         )
         await db.execute(
             "DELETE FROM message_deliveries WHERE msg_id NOT IN (SELECT id FROM messages)"
+        )
+        await db.execute(
+            "DELETE FROM message_media_hashes WHERE msg_id NOT IN (SELECT id FROM messages)"
         )
         cur2 = await db.execute(
             "UPDATE messages SET embedding = NULL WHERE embedding IS NOT NULL AND created_at < ?",
@@ -294,6 +306,30 @@ async def cleanup_old_data(message_retention_days: int, embedding_retention_hour
         cleared = cur2.rowcount
         await db.commit()
     return deleted, cleared
+
+
+async def save_message_media_hashes(msg_id: int, hashes: list[str]):
+    if not hashes:
+        return
+    async with aiosqlite.connect(config.DB_PATH) as db:
+        await db.executemany(
+            "INSERT INTO message_media_hashes (msg_id, phash) VALUES (?, ?)",
+            [(msg_id, h) for h in hashes],
+        )
+        await db.commit()
+
+
+async def get_recent_forwarded_media_hashes(hours: int = 24) -> list[str]:
+    """Perceptual hash'и медиа пересланных постов за окно (для медиа-дедупа)."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    async with aiosqlite.connect(config.DB_PATH) as db:
+        async with db.execute(
+            """SELECT h.phash FROM message_media_hashes h
+               JOIN messages m ON m.id = h.msg_id
+               WHERE m.forwarded = 1 AND m.created_at > ?""",
+            (cutoff,),
+        ) as cur:
+            return [r[0] for r in await cur.fetchall()]
 
 
 async def get_recent_forwarded_concepts(hours: int = 24) -> list[list[str]]:

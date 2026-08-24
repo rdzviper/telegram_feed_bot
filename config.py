@@ -40,7 +40,7 @@ RATE_LIMIT_PER_HOUR = int(os.environ.get("RATE_LIMIT_PER_HOUR", "20"))
 DRIFT_EVERY_N = int(os.environ.get("DRIFT_EVERY_N", "20"))
 
 DUPLICATE_OVERLAP_THRESHOLD = float(os.environ.get("DUPLICATE_OVERLAP_THRESHOLD", "0.6"))
-DUPLICATE_HOURS = int(os.environ.get("DUPLICATE_HOURS", "24"))
+DUPLICATE_HOURS = int(os.environ.get("DUPLICATE_HOURS", "168"))  # 7 дней
 
 # --- Семантический дедуп (эмбеддинги саммари, A1) ---
 EMBEDDING_API_KEY = os.environ.get("EMBEDDING_API_KEY", "")
@@ -53,12 +53,20 @@ EMBEDDING_DIM = int(os.environ.get("EMBEDDING_DIM", "512"))
 # через .env без пересборки (снижать = больше охват, повышать = безопаснее).
 DUPLICATE_COSINE_THRESHOLD = float(os.environ.get("DUPLICATE_COSINE_THRESHOLD", "0.75"))
 
+# --- Дедуп медиа по перцептивному хэшу превью (MVP, 2026-08-18): хэш строится
+# по одному кадру (превью от Telegram), multi-frame для видео не делаем —
+# см. SPEC.md. Не откалибровано на золотом сете — старт консервативный,
+# крутить через .env по факту наблюдений.
+MEDIA_HASH_THRESHOLD = int(os.environ.get("MEDIA_HASH_THRESHOLD", "6"))
+
 UNKNOWN_CONCEPT_EPS = float(os.environ.get("UNKNOWN_CONCEPT_EPS", "0.01"))
 
 # --- Retention: embedding нужен только внутри окна дедупа (DUPLICATE_HOURS),
 # сам текст/мета дальше хранятся лишь для истории/просмотра — неделя достаточно.
 MESSAGE_RETENTION_DAYS = int(os.environ.get("MESSAGE_RETENTION_DAYS", "7"))
-EMBEDDING_RETENTION_HOURS = int(os.environ.get("EMBEDDING_RETENTION_HOURS", "24"))
+# по умолчанию = DUPLICATE_HOURS, а не независимая константа — рассинхрон
+# больше не может случиться молча при следующей правке окна дедупа
+EMBEDDING_RETENTION_HOURS = int(os.environ.get("EMBEDDING_RETENTION_HOURS", DUPLICATE_HOURS))
 CLEANUP_INTERVAL_HOURS = int(os.environ.get("CLEANUP_INTERVAL_HOURS", "24"))
 
 ALLOWED_USER_ID = int(os.environ["ALLOWED_USER_ID"])

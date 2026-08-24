@@ -4,3 +4,5 @@ aiosqlite==0.20.0
 openai>=1.57.0
 python-dotenv==1.0.1
 numpy>=1.26,<3
+Pillow>=10,<12
+ImageHash>=4.3,<5

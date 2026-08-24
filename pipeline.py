@@ -14,6 +14,7 @@ import config
 import database as db
 import analyzer
 import embeddings
+import media_hash
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +66,30 @@ def _rate_limit_ok() -> bool:
     while _forwarded_times and now - _forwarded_times[0] > 3600:
         _forwarded_times.popleft()
     return len(_forwarded_times) < config.RATE_LIMIT_PER_HOUR
+
+
+async def _hash_album_media(event, media_ids: list[int], channel_id: int) -> list[str]:
+    """Хэш превью для каждого media-item поста (альбом = несколько). Основной
+    item уже есть в event.message; остальные (только id) подтягиваем."""
+    primary_id = event.message.id
+    messages = [event.message]
+    other_ids = [m for m in media_ids if m != primary_id]
+    if other_ids:
+        try:
+            fetched = await _tg_client.get_messages(channel_id, ids=other_ids)
+        except Exception as e:
+            logger.warning("Fetch album items failed for channel_id=%s: %s", channel_id, e)
+            fetched = []
+        if not isinstance(fetched, list):
+            fetched = [fetched]
+        messages += [m for m in fetched if m is not None]
+
+    hashes = []
+    for msg in messages:
+        h = await media_hash.hash_message(_tg_client, msg)
+        if h:
+            hashes.append(h)
+    return hashes
 
 
 async def process_message(event, media_ids: list[int]):
@@ -151,6 +176,25 @@ async def process_message(event, media_ids: list[int]):
                 logger.info("Duplicate (cosine=%.3f ≥ %.2f): channel=%s summary=%.80r",
                             best, config.DUPLICATE_COSINE_THRESHOLD, channel_name, summary)
 
+    # Layer 2: perceptual hash медиа-превью — покрывает то, что текст/cosine
+    # слои не видят: медиа без подписи или с сильно разными подписями (media_only
+    # или разные каналы переписали текст). Независим от media_only.
+    media_hashes: list[str] = []
+    if has_media:
+        media_hashes = await _hash_album_media(event, media_ids, channel_id)
+        if media_hashes and not same_story:
+            recent_hashes = await db.get_recent_forwarded_media_hashes(hours=config.DUPLICATE_HOURS)
+            for h in media_hashes:
+                for rh in recent_hashes:
+                    dist = media_hash.hamming(h, rh)
+                    if dist <= config.MEDIA_HASH_THRESHOLD:
+                        same_story = True
+                        logger.info("Duplicate (media hash, distance=%d ≤ %d): channel=%s",
+                                    dist, config.MEDIA_HASH_THRESHOLD, channel_name)
+                        break
+                if same_story:
+                    break
+
     logger.info(
         "Analyzed: channel=%s concepts=%s local_score=%.1f threshold=%.1f is_ad=%s same_story=%s informative=%s media=%s",
         channel_name, concepts, local_score, threshold, is_ad, same_story, informative, has_media,
@@ -171,6 +215,7 @@ async def process_message(event, media_ids: list[int]):
         await db.save_message_semantic(
             msg_id, summary, embeddings.to_blob(embedding) if embedding is not None else None
         )
+        await db.save_message_media_hashes(msg_id, media_hashes)
     except Exception as e:
         logger.error("DB save failed: %s", e, exc_info=True)
         return
