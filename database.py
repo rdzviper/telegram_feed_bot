@@ -319,14 +319,20 @@ async def save_message_media_hashes(msg_id: int, hashes: list[str]):
         await db.commit()
 
 
-async def get_recent_forwarded_media_hashes(hours: int = 24) -> list[str]:
-    """Perceptual hash'и медиа пересланных постов за окно (для медиа-дедупа)."""
+async def get_recent_media_hashes(hours: int = 24) -> list[str]:
+    """Perceptual hash'и медиа всех виденных постов за окно (не только пересланных).
+
+    В отличие от текст/cosine-слоёв дедупа, здесь намеренно НЕ фильтруем по
+    forwarded=1: пост, помеченный как дубликат, сам не пересылается, но его
+    хэш обязан остаться в пуле сравнения — иначе цепочка A~B~C (B похож и на A,
+    и на C, но A и C уже за порогом друг от друга из-за перекодирования
+    превью Telegram'ом) рвётся на B, и C проскакивает мимо дедупа как "новое"."""
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
     async with aiosqlite.connect(config.DB_PATH) as db:
         async with db.execute(
             """SELECT h.phash FROM message_media_hashes h
                JOIN messages m ON m.id = h.msg_id
-               WHERE m.forwarded = 1 AND m.created_at > ?""",
+               WHERE m.created_at > ?""",
             (cutoff,),
         ) as cur:
             return [r[0] for r in await cur.fetchall()]

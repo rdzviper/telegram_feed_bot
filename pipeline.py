@@ -183,7 +183,7 @@ async def process_message(event, media_ids: list[int]):
     if has_media:
         media_hashes = await _hash_album_media(event, media_ids, channel_id)
         if media_hashes and not same_story:
-            recent_hashes = await db.get_recent_forwarded_media_hashes(hours=config.DUPLICATE_HOURS)
+            recent_hashes = await db.get_recent_media_hashes(hours=config.DUPLICATE_HOURS)
             for h in media_hashes:
                 for rh in recent_hashes:
                     dist = media_hash.hamming(h, rh)

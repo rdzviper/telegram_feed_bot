@@ -1,4 +1,4 @@
-import asyncio
+﻿import asyncio
 import logging
 import os
 
@@ -61,7 +61,26 @@ async def main():
     asyncio.ensure_future(pipeline_worker())
 
     async def cleanup_worker():
+        # Раз в сутки: полная ресинхронизация dialogs userbot-сессии (чинит
+        # гэп Telethon — после отписки на телефоне сессия бота продолжает
+        # получать апдейты по каналу, пока не пересоберёт dialogs/PTS-state,
+        # см. memory/2026-08-24) + чистка ретеншена старых данных. Один цикл
+        # сна на оба действия — блок обслуживания.
         while True:
+            try:
+                dialogs = await tg_client.get_dialogs()
+                active_ids = {d.id for d in dialogs}
+                pruned = await db.prune_channels(active_ids)
+                if pruned:
+                    logger.info(
+                        "Daily resync: pruned %d unsubscribed channels: %s",
+                        len(pruned), pruned,
+                    )
+                else:
+                    logger.info("Daily resync: dialogs synced, no stale channels")
+            except Exception as e:
+                logger.error("Dialog resync error: %s", e, exc_info=True)
+
             try:
                 deleted, cleared = await db.cleanup_old_data(
                     config.MESSAGE_RETENTION_DAYS, config.EMBEDDING_RETENTION_HOURS
