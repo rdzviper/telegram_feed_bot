@@ -80,6 +80,7 @@ _MIGRATIONS = [
     "ALTER TABLE messages ADD COLUMN delivery_state TEXT DEFAULT 'delivered'",
     "ALTER TABLE messages ADD COLUMN media_ids TEXT",
     "ALTER TABLE messages ADD COLUMN threshold_at_score REAL",
+    "ALTER TABLE messages ADD COLUMN informative INTEGER DEFAULT 1",
 ]
 
 
@@ -155,13 +156,15 @@ async def save_message(
     score: int,
     is_ad: bool,
     same_story: bool,
+    informative: bool = True,
 ) -> int:
     async with aiosqlite.connect(config.DB_PATH) as db:
         cur = await db.execute(
             """INSERT INTO messages
-               (channel_id, channel_name, orig_message_id, text, date, score, is_ad, same_story)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (channel_id, channel_name, orig_message_id, text, date, score, int(is_ad), int(same_story)),
+               (channel_id, channel_name, orig_message_id, text, date, score, is_ad, same_story, informative)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (channel_id, channel_name, orig_message_id, text, date, score,
+             int(is_ad), int(same_story), int(informative)),
         )
         await db.commit()
         return cur.lastrowid
@@ -190,6 +193,45 @@ async def get_message_concepts(msg_id: int) -> list[str]:
             if row and row[0]:
                 return json.loads(row[0])
             return []
+
+
+async def get_message_by_origin(channel_id: int, orig_message_id: int) -> int | None:
+    """Резолвит msg_id по (channel_id, orig_message_id) исходного канального
+    поста — так «пропущенное» находится по форварду, присланному Алексом
+    боту в личку (Bot API отдаёт эту пару в forward_origin)."""
+    async with aiosqlite.connect(config.DB_PATH) as db:
+        async with db.execute(
+            "SELECT id FROM messages WHERE channel_id = ? AND orig_message_id = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (channel_id, orig_message_id),
+        ) as cur:
+            row = await cur.fetchone()
+            return row[0] if row else None
+
+
+async def get_correction_info(msg_id: int) -> dict | None:
+    """Всё нужное, чтобы объяснить пропуск и (если применимо) поднять веса
+    концептов поста до текущего threshold."""
+    async with aiosqlite.connect(config.DB_PATH) as db:
+        async with db.execute(
+            """SELECT channel_name, local_score, is_ad, same_story, informative,
+                      forwarded, user_choice, concepts
+               FROM messages WHERE id = ?""",
+            (msg_id,),
+        ) as cur:
+            row = await cur.fetchone()
+            if not row:
+                return None
+            return {
+                "channel_name": row[0],
+                "local_score": row[1] if row[1] is not None else 0.0,
+                "is_ad": bool(row[2]),
+                "same_story": bool(row[3]),
+                "informative": bool(row[4]),
+                "forwarded": bool(row[5]),
+                "user_choice": row[6],
+                "concepts": json.loads(row[7]) if row[7] else [],
+            }
 
 
 async def mark_forwarded(msg_id: int, media_ids: list[int], is_drift: bool, threshold: float):

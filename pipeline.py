@@ -61,6 +61,10 @@ async def refresh_threshold():
     logger.info("Threshold refreshed: %.3f", _threshold)
 
 
+def get_threshold() -> float:
+    return _threshold
+
+
 def _rate_limit_ok() -> bool:
     now = datetime.now(timezone.utc).timestamp()
     while _forwarded_times and now - _forwarded_times[0] > 3600:
@@ -210,6 +214,7 @@ async def process_message(event, media_ids: list[int]):
             score=round(local_score),
             is_ad=is_ad,
             same_story=same_story,
+            informative=informative,
         )
         await db.save_message_concepts(msg_id, concepts, local_score)
         await db.save_message_semantic(

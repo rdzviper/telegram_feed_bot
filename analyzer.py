@@ -21,17 +21,44 @@ else:
 
 logger.info("analyzer: AI_PROVIDER=%s model=%s", config.AI_PROVIDER, _MODEL)
 
+# Разовый алерт в DM_CHAT_ID при исчерпании баланса провайдера — чтобы не искать
+# причину падения скоринга по логам вручную. bot ставится из bot.py при старте
+# (см. set_notify_bot); флаг сбрасывается на первый же успешный вызов, поэтому
+# при повторном исчерпании баланса алерт придёт снова.
+_notify_bot = None
+_balance_alert_sent = False
+
+
+def set_notify_bot(bot):
+    global _notify_bot
+    _notify_bot = bot
+
+
+async def _alert_balance_exhausted():
+    global _balance_alert_sent
+    if _balance_alert_sent or _notify_bot is None:
+        return
+    _balance_alert_sent = True
+    try:
+        await _notify_bot.send_message(
+            chat_id=config.DM_CHAT_ID,
+            text=(
+                f"⚠️ Баланс {config.AI_PROVIDER} ({_MODEL}) закончился — "
+                "анализ постов идёт в fallback-режиме (без концептов и скоринга), "
+                "пока баланс не пополнится."
+            ),
+        )
+    except Exception as notify_err:
+        logger.error("Failed to send balance alert: %s", notify_err)
+
 _ANALYZE_PROMPT = """\
 Проанализируй Telegram-пост и верни JSON.
-
-АНАЛИЗИРУЕМЫЙ ПОСТ:
-{text}
 
 Верни строго JSON без пояснений:
 {{"concepts": ["концепт1", ...], "is_ad": false, "informative": true, "summary": "суть события одной фразой"}}
 
 Правила:
-- concepts: ровно {n} ключевых концептов (можно меньше, только если значимых в тексте реально меньше). Форма: именительный падеж, ед. число.
+- concepts: точное требуемое количество указано в конце запроса вместе с текстом поста (можно меньше, только если значимых в тексте реально меньше). Форма: именительный падеж, ед. число.
 - КАНОНИЗАЦИЯ (критично для сравнения постов): один и тот же объект ВСЕГДА должен давать одну и ту же строку, независимо от того, как он назван в тексте. Приводи к самой узнаваемой общепринятой форме:
   • Аббревиатура и полное название → одна форма: "Counter-Strike 2" и "CS2" → "CS2"; "искусственный интеллект" и "ИИ" → "ИИ"; "Playstation 5" и "PS5" → "PS5".
   • Убирай уточнения, порядковые номера, эпитеты — до базового существительного: "собаки-заложники" → "собака"; "5-й сезон Premier" → "сезон Premier"; "бездомный кот" → "кот".
@@ -55,7 +82,12 @@ _ANALYZE_PROMPT = """\
   • НО НЕ включай сущности, которые лишь СОПРОВОЖДАЮТ главный субъект и варьируются между постами об одном событии — они раздувают различие векторов: платформа, на которой выходит продукт (PS5, Xbox, iOS); студия/издатель/производитель продукта (Sony, Ubisoft); цена; способ распространения ("физические диски"); названия роликов/трейлеров/эпизодов; ссылки; относительные сроки ("через два месяца", "на днях"); эпитеты ("брутальный", "кинематографичный"). Абсолютную дату включай ТОЛЬКО если сама дата — суть новости.
   • Только установленный факт события. ВЫКИНЬ догадки/эмоции/вопросы/источники/оценки/призывы/филлер ("возможно", "кажется", "началось?", "пишут", "по данным").
   • Разные посты об ОДНОМ событии обязаны дать почти идентичную summary; разные события — разную.
-  • Примеры: "Marvel's Wolverine: вышел новый трейлер"; "Россия: GitHub, Google, Apple — перебои доступа без VPN"; "Точка контакта, колонии: госмессенджер тестируют для заключённых"\
+  • Примеры: "Marvel's Wolverine: вышел новый трейлер"; "Россия: GitHub, Google, Apple — перебои доступа без VPN"; "Точка контакта, колонии: госмессенджер тестируют для заключённых"
+
+ЧИСЛО КОНЦЕПТОВ ДЛЯ ЭТОГО ПОСТА: {n}
+
+АНАЛИЗИРУЕМЫЙ ПОСТ:
+{text}\
 """
 
 _CALL_KWARGS = dict(
@@ -99,6 +131,7 @@ def _fallback(text: str) -> dict:
 
 
 async def analyze(text: str) -> dict:
+    global _balance_alert_sent
     words = text.split()
     if len(words) <= _SHORT_POST_MAX_WORDS:
         concepts = _short_post_concepts(text)
@@ -116,6 +149,7 @@ async def analyze(text: str) -> dict:
             **_CALL_KWARGS,
         )
         content = response.choices[0].message.content or ""
+        _balance_alert_sent = False  # провайдер ответил — баланс жив, можно алертить заново при следующем сбое
         logger.debug("DeepSeek raw: %r", content)
         if not content.strip():
             logger.warning("DeepSeek returned empty content, using defaults")
@@ -129,4 +163,6 @@ async def analyze(text: str) -> dict:
         }
     except Exception as e:
         logger.error("DeepSeek error: %s", e)
+        if "insufficient balance" in str(e).lower():
+            await _alert_balance_exhausted()
         return _fallback(text)

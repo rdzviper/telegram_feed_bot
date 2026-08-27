@@ -10,6 +10,7 @@ from telegram.request import HTTPXRequest
 import config
 import database as db
 import pipeline
+import analyzer
 from pipeline import process_message
 from handlers import register_handlers, set_bot_commands
 from plugins import load_plugins
@@ -38,6 +39,7 @@ async def main():
     )
     bot = Bot(token=config.BOT_TOKEN, request=_request)
     pipeline.set_clients(tg_client, bot)
+    analyzer.set_notify_bot(bot)
 
     queue: asyncio.Queue = asyncio.Queue()
     # буфер альбомов: grouped_id -> {"event": праймари, "ids": [msg_id...], "timer": handle}

@@ -1,10 +1,19 @@
+import asyncio
 import logging
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    BotCommand,
+    MessageOriginChannel,
+)
 from telegram.ext import (
     ContextTypes,
     CommandHandler,
     CallbackQueryHandler,
+    MessageHandler,
     MessageReactionHandler,
+    filters,
 )
 import database as db
 import config
@@ -161,6 +170,117 @@ async def reaction_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+# Album forward = N separate Telegram messages (one per media item), each with
+# its own orig_message_id — only the captioned/primary item has a `messages`
+# row. Buffer by media_group_id and resolve once, mirroring bot.py's album
+# debounce on the userbot ingest side.
+_FORWARD_ALBUM_DEBOUNCE_SEC = 1.5
+_pending_forwards: dict[str, dict] = {}
+
+
+async def _resolve_and_reply(bot, chat_id: int, origins: list[tuple[int, int]]):
+    msg_id = None
+    for channel_id, orig_message_id in origins:
+        msg_id = await db.get_message_by_origin(channel_id, orig_message_id)
+        if msg_id is not None:
+            break
+
+    if msg_id is None:
+        await bot.send_message(
+            chat_id,
+            "Не нашёл в базе. Либо это очень старый пост (ретеншен подчистил), "
+            "либо канал был отключён, когда он пришёл.",
+        )
+        return
+
+    info = await db.get_correction_info(msg_id)
+    threshold = pipeline.get_threshold()
+    score = info["local_score"]
+
+    if info["forwarded"]:
+        await bot.send_message(
+            chat_id,
+            f"🤷 <b>{info['channel_name']}</b>\nОн был доставлен (score={score:.1f}) — "
+            "видимо, пролистал.",
+            parse_mode="HTML",
+        )
+        return
+
+    if info["is_ad"]:
+        reason = "отмечен как реклама"
+    elif info["same_story"]:
+        reason = "признан дублем недавнего поста"
+    elif not info["informative"]:
+        reason = "признан неинформативным (боевая фильтрация, не по скору)"
+    else:
+        reason = "score не дотянул до threshold"
+
+    concepts = info["concepts"]
+    text = (
+        f"📉 <b>{info['channel_name']}</b>\n"
+        f"score={score:.1f} / threshold={threshold:.1f}\n"
+        f"Причина: {reason}\n"
+        f"Топики: {', '.join(concepts) if concepts else '—'}"
+    )
+
+    keyboard = None
+    if info["user_choice"]:
+        text += "\n\n✅ уже скорректировано"
+    elif info["is_ad"] or info["same_story"] or not info["informative"]:
+        text += "\n\n⚠️ это жёсткий фильтр, поднятие веса топиков тут не поможет"
+    elif not concepts:
+        text += "\n\n⚠️ нет топиков — нечего поднимать"
+    elif score >= threshold:
+        text += "\n\n⚠️ score уже не ниже threshold — не должно было пропуститься сейчас"
+    else:
+        x = (threshold - score) / len(concepts)
+        keyboard = InlineKeyboardMarkup(
+            [[InlineKeyboardButton(f"➕ Добавить (+{x:.2f}/топик)", callback_data=f"boost:{msg_id}")]]
+        )
+
+    await bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=keyboard)
+
+
+async def _flush_forward_album(gid: str, bot):
+    slot = _pending_forwards.pop(gid, None)
+    if slot is None:
+        return
+    await _resolve_and_reply(bot, slot["chat_id"], slot["origins"])
+
+
+async def forward_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Alex forwards a channel post he saw but the bot never delivered.
+    forward_origin gives back (channel_id, orig_message_id) of the source
+    post, which is exactly the key `messages` was saved under — every
+    analyzed post is saved regardless of whether it was forwarded."""
+    if not _authorized(update):
+        return
+    origin = update.message.forward_origin
+    if not isinstance(origin, MessageOriginChannel):
+        await update.message.reply_text(
+            "Не смог определить канал-источник — перешли пост прямо из канала."
+        )
+        return
+
+    gid = update.message.media_group_id
+    if gid is None:
+        await _resolve_and_reply(
+            context.bot, update.effective_chat.id, [(origin.chat.id, origin.message_id)]
+        )
+        return
+
+    slot = _pending_forwards.get(gid)
+    if slot is None:
+        slot = _pending_forwards[gid] = {"chat_id": update.effective_chat.id, "origins": [], "timer": None}
+    slot["origins"].append((origin.chat.id, origin.message_id))
+    if slot["timer"] is not None:
+        slot["timer"].cancel()
+    slot["timer"] = asyncio.get_event_loop().call_later(
+        _FORWARD_ALBUM_DEBOUNCE_SEC,
+        lambda: asyncio.ensure_future(_flush_forward_album(gid, context.bot)),
+    )
+
+
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not _authorized(update):
@@ -193,6 +313,31 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
+    elif data.startswith("boost:"):
+        msg_id = int(data.split(":", 1)[1])
+        info = await db.get_correction_info(msg_id)
+        if info is None or info["user_choice"]:
+            await query.answer("Уже применено", show_alert=True)
+            await query.edit_message_reply_markup(reply_markup=None)
+            return
+
+        concepts = info["concepts"]
+        threshold = pipeline.get_threshold()
+        score = info["local_score"]
+        if not concepts or score >= threshold:
+            await query.answer("Условия успели измениться, отменил", show_alert=True)
+            await query.edit_message_reply_markup(reply_markup=None)
+            return
+
+        x = (threshold - score) / len(concepts)
+        await db.update_interests(concepts, delta=x)
+        await db.set_user_choice(msg_id, "boost")
+        await pipeline.refresh_threshold()
+        logger.info("boost applied: msg_id=%s concepts=%d x=%.2f", msg_id, len(concepts), x)
+
+        await query.answer(f"+{x:.2f} к {len(concepts)} топикам", show_alert=True)
+        await query.edit_message_reply_markup(reply_markup=None)
+
     else:
         await query.answer()
 
@@ -222,4 +367,5 @@ def register_handlers(application):
     application.add_handler(CommandHandler("channels", channels_command))
     application.add_handler(CallbackQueryHandler(button_callback))
     application.add_handler(MessageReactionHandler(reaction_callback))
+    application.add_handler(MessageHandler(filters.FORWARDED & filters.ChatType.PRIVATE, forward_callback))
     application.add_error_handler(error_handler)
