@@ -19,3 +19,13 @@ venv/
 # IDE
 .vscode/
 .idea/
+
+# Scratch/debug scripts and data dumps (contain real channel/message data)
+scripts/dump_*.py
+scripts/_tmp_*.py
+scripts/*.txt
+scripts/*.sqlite
+_cluster8_out.txt
+STATS_BASELINE.md
+tests/image examples/
+
